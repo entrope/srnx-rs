@@ -1,6 +1,6 @@
 //! Convert an observation file (SRNX, RINEX or Compact RINEX) to SRNX.
 //!
-//! `cargo run --release --example to_srnx -- [--socd] <input> <output.srnx>`
+//! `cargo run --release --example to_srnx -- [--socd] [--threads=N] <input> <output.srnx>`
 
 use std::process::ExitCode;
 
@@ -9,12 +9,18 @@ use srnx::writer::{self, ObsChunk, WriteOptions};
 fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let mut options = WriteOptions::default();
-    if args.first().is_some_and(|a| a == "--socd") {
-        options.obs_chunk = ObsChunk::Socd;
+    while let Some(arg) = args.first().filter(|a| a.starts_with("--")) {
+        if arg == "--socd" {
+            options.obs_chunk = ObsChunk::Socd;
+        } else if let Some(Ok(n)) = arg.strip_prefix("--threads=").map(str::parse) {
+            options.threads = n;
+        } else {
+            break;
+        }
         args.remove(0);
     }
     let [input, output] = args.as_slice() else {
-        eprintln!("usage: to_srnx [--socd] <input> <output.srnx>");
+        eprintln!("usage: to_srnx [--socd] [--threads=N] <input> <output.srnx>");
         return ExitCode::from(2);
     };
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {

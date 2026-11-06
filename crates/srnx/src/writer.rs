@@ -603,17 +603,19 @@ fn encode_satellite(
     scratch: &mut Scratch,
 ) -> Result<Encoded, WriteError> {
     let sat = satellite.id;
-    let mut epochs: Vec<usize> = satellite
+    // The satellite epochs: every epoch that lists the satellite or has
+    // one of its observations.
+    let mut listed = vec![false; context.epoch_count];
+    let all = satellite
         .series
         .iter()
-        .flat_map(|(_, series)| series.iter().map(|&(e, _)| e))
-        .chain(satellite.listed.iter().copied())
-        .collect();
-    epochs.sort_unstable();
-    epochs.dedup();
-    if epochs.last().is_some_and(|&e| e >= context.epoch_count) {
-        return Err(invalid(format!("{sat}: epoch index past the last epoch")));
+        .flat_map(|(_, series)| series.iter().map(|&(e, _)| e));
+    for e in all.chain(satellite.listed.iter().copied()) {
+        *listed
+            .get_mut(e)
+            .ok_or_else(|| invalid(format!("{sat}: epoch index past the last epoch")))? = true;
     }
+    let epochs: Vec<usize> = (0..listed.len()).filter(|&e| listed[e]).collect();
     let columns = columns(satellite, &epochs)?;
 
     let times: Vec<i128> = epochs.iter().map(|&e| context.times[e]).collect();
@@ -750,16 +752,19 @@ fn write_rle(out: &mut Vec<u8>, symbols: impl Iterator<Item = u8>, alphabet: u64
 /// The explicit scale for `values`: the greatest common divisor of the
 /// present values, or 1 if that is 0 or too large.
 fn scale(values: &[i64]) -> u64 {
-    let gcd = values
-        .iter()
-        .filter(|&&v| v != ABSENT)
-        .fold(0u64, |mut a, &v| {
-            let mut b = v.unsigned_abs();
-            while b != 0 {
-                (a, b) = (b, a % b);
-            }
-            a
-        });
+    let mut gcd = 0u64;
+    for &v in values {
+        if v == ABSENT {
+            continue;
+        }
+        let mut b = v.unsigned_abs();
+        while b != 0 {
+            (gcd, b) = (b, gcd % b);
+        }
+        if gcd == 1 {
+            break;
+        }
+    }
     if gcd == 0 || gcd > MAX_SCALE {
         1
     } else {
@@ -769,7 +774,11 @@ fn scale(values: &[i64]) -> u64 {
 
 /// Divide a present value by the column's scale (which divides it).
 fn scaled(value: i64, scale: u64) -> i64 {
-    value / i64::try_from(scale).unwrap()
+    if scale == 1 {
+        value
+    } else {
+        value / i64::try_from(scale).unwrap()
+    }
 }
 
 fn socd_payload(name: [u8; 8], column: &Column, scratch: &mut Scratch) -> Vec<u8> {
@@ -799,6 +808,49 @@ fn socd_payload(name: [u8; 8], column: &Column, scratch: &mut Scratch) -> Vec<u8
         .collect();
     pack::encode(&mut payload, &entries, scale, Coding::Matrix, scratch);
     payload
+}
+
+/// [`Soc2Coder::entries`] for a value predictor: `reference × num / den`,
+/// rounded as [`rounded`] does, in 64 bits where the product fits.
+fn value_entries(
+    values: &[i64],
+    reference: &[i64],
+    scale: u64,
+    num: i64,
+    den: u64,
+) -> Option<Vec<Entry>> {
+    let den64 = i64::try_from(den).ok();
+    let mut entries = Vec::with_capacity(values.len());
+    for (&v, &r) in values.iter().zip(reference) {
+        entries.push(if v == ABSENT {
+            Entry::Absent
+        } else if r == ABSENT {
+            Entry::Unpredicted(scaled(v, scale))
+        } else {
+            let p = match (r.checked_mul(num), den64) {
+                (Some(product), Some(den)) => i128::from(rounded64(product, den)),
+                _ => rounded(i128::from(r) * i128::from(num), i128::from(den)).ok()?,
+            };
+            let q = if scale == 1 {
+                p
+            } else {
+                rounded(p, i128::from(scale)).ok()?
+            };
+            Entry::Coded(i64::try_from(i128::from(scaled(v, scale)) - q).ok()?)
+        });
+    }
+    Some(entries)
+}
+
+/// [`rounded`] in 64 bits: `num / den` to the nearest integer, ties away
+/// from zero; `den` is positive.
+fn rounded64(num: i64, den: i64) -> i64 {
+    let (q, rem) = (num / den, num % den);
+    if rem.abs() >= den / 2 + den % 2 {
+        q + num.signum()
+    } else {
+        q
+    }
 }
 
 /// Codes one satellite's `SOC2` chunks.
@@ -853,6 +905,9 @@ impl Soc2Coder<'_> {
                 Some(&self.column(reference).values)
             }
         };
+        if let (Predictor::Value { num, den, .. }, Some(reference)) = (predictor, reference) {
+            return value_entries(values, reference, scale, num, den);
+        }
         let milli = |i: usize| {
             reference
                 .and_then(|r| r.get(i))

@@ -10,6 +10,8 @@
 //! upward until two fail to improve; `SOC2` orders start from an estimate
 //! and move to neighbouring orders while that helps.
 
+use std::collections::VecDeque;
+
 use crate::leb128::{sleb128_len, uleb128_len, write_sleb128, write_uleb128, zigzag};
 
 /// `SOCD` bit-matrix block sizes, by the top three bits of the header byte.
@@ -81,6 +83,54 @@ impl Block {
     }
 }
 
+/// A [`Block`] packed into a `u64`: the kind in the top byte, then the
+/// size index and the bit width or Rice parameter, or a run length.  The
+/// search keeps its best edge in one, so choosing between edges needs no
+/// branches.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Choice(u64);
+
+impl Choice {
+    const SLEB: u64 = 1 << 56;
+    const ZEROS: u64 = 2 << 56;
+    const MATRIX: u64 = 3 << 56;
+    const RICE: u64 = 4 << 56;
+
+    fn block(self) -> Block {
+        let low = self.0 & ((1 << 56) - 1);
+        #[allow(clippy::cast_possible_truncation)]
+        let (size, param) = ((low >> 8) as usize, (low & 0xFF) as usize);
+        match self.0 & !((1 << 56) - 1) {
+            Self::SLEB => Block::Sleb(low as usize),
+            Self::ZEROS => Block::Zeros(low as usize),
+            Self::MATRIX => Block::Matrix { size, bits: param },
+            Self::RICE => Block::Rice { size, r: param },
+            _ => Block::Unset,
+        }
+    }
+}
+
+impl From<Block> for Choice {
+    fn from(block: Block) -> Self {
+        Self(match block {
+            Block::Unset => 0,
+            Block::Sleb(n) => Self::SLEB | n as u64,
+            Block::Zeros(n) => Self::ZEROS | n as u64,
+            Block::Matrix { size, bits } => Self::MATRIX | (size as u64) << 8 | bits as u64,
+            Block::Rice { size, r } => Self::RICE | (size as u64) << 8 | r as u64,
+        })
+    }
+}
+
+/// Make `(cost, choice)` the best edge if it is cheaper, without a branch.
+#[inline]
+fn offer(best: &mut (u64, Choice), cost: u64, choice: Block) {
+    let choice = Choice::from(choice);
+    let better = cost < best.0;
+    best.0 = if better { cost } else { best.0 };
+    best.1 = Choice(if better { choice.0 } else { best.1 .0 });
+}
+
 /// Reusable buffers for packing, so a file's many columns need few
 /// allocations.
 #[derive(Default)]
@@ -90,9 +140,16 @@ pub(crate) struct Scratch {
     deltas: Vec<i64>,
     /// Bit widths of `deltas`, for the rows filled so far.
     widths: Vec<u8>,
-    /// Block choices of the best delta order so far, and of a candidate.
-    best: Vec<Block>,
-    cand: Vec<Block>,
+    /// Sum of the bit widths of the nonzero values of each row in `widths`.
+    width_sums: [u64; 8],
+    /// Sum of the SLEB128 lengths of each row in `widths`.
+    sleb_sums: [u64; 8],
+    /// Runs of consecutive coded values, as (first, count) in `coded`.
+    runs: Vec<(usize, usize)>,
+    /// Block choices of the best delta order so far, and of a candidate,
+    /// one per coded value.
+    best: Vec<Choice>,
+    cand: Vec<Choice>,
     search: Search,
 }
 
@@ -102,7 +159,11 @@ struct Search {
     /// `cost[i]`: fewest bytes coding the values from position `i`.
     cost: Vec<u64>,
     /// Prefix sums of SLEB128 lengths.
-    sleb_sum: Vec<u32>,
+    sleb_sum: Vec<u64>,
+    /// Candidate ends `j` of an SLEB128 run, with `sleb_sum[j] + cost[j]`,
+    /// for a sliding-window minimum: ends decrease and values increase
+    /// from front to back.
+    sleb_ends: VecDeque<(usize, u64)>,
     /// Row `k` holds the widest value of each window of `MATRIX_SIZES[k]`.
     window: Vec<u8>,
     /// Prefix sums of capped `ZigZag` values.
@@ -110,6 +171,56 @@ struct Search {
     /// Position-major prefix sums of capped Rice quotients plus one, one
     /// per Rice parameter.  Sums wrap; differences over a block are exact.
     q_sum: Vec<u32>,
+}
+
+/// The split-Rice blocks from one position of [`Search::rice`].
+struct RiceStep<'a> {
+    search: &'a Search,
+    i: usize,
+    remaining: usize,
+    /// Rice parameters with prefix sums, and the largest one.
+    width: usize,
+    r_max: usize,
+}
+
+impl RiceStep<'_> {
+    /// Offer the best split-Rice block of size `RICE_SIZES[SIZE]`, starting
+    /// the parameter search from `r_start`.  Returns false if the block
+    /// does not fit, nor any larger one.
+    #[inline]
+    fn size<const SIZE: usize>(
+        &self,
+        r_start: &mut Option<usize>,
+        best: &mut (u64, Choice),
+    ) -> bool {
+        let m = RICE_SIZES[SIZE];
+        if self.remaining < m {
+            return false;
+        }
+        let (search, i, width) = (self.search, self.i, self.width);
+        let mean = search.u_sum[i + m].wrapping_sub(search.u_sum[i]) / m as u64;
+        let r_hi = bit_len(mean).min(self.r_max);
+        let qa = &search.q_sum[i * width..(i + 1) * width];
+        let qb = &search.q_sum[(i + m) * width..(i + m + 1) * width];
+        let bits = |r: usize| (r * m) as u64 + u64::from(qb[r].wrapping_sub(qa[r]));
+        // A block's bit count is convex in r, so walk downhill.
+        let start = r_start.map_or(r_hi, |s| s.min(r_hi));
+        let (mut r, mut best_bits) = (start, bits(start));
+        while r > 0 && bits(r - 1) < best_bits {
+            r -= 1;
+            best_bits = bits(r);
+        }
+        if r == start {
+            while r < r_hi && bits(r + 1) < best_bits {
+                r += 1;
+                best_bits = bits(r);
+            }
+        }
+        *r_start = Some(r);
+        let cost = 1 + best_bits.div_ceil(8) + search.cost[i + m];
+        offer(best, cost, Block::Rice { size: SIZE, r });
+        true
+    }
 }
 
 /// Two's-complement bit width of `v`, at least 1.
@@ -146,14 +257,14 @@ fn fill_deltas(values: &[i64], deltas: &mut Vec<i64>) {
 impl Search {
     /// Choose `SOCD` blocks for `vals`, whose bit widths are `widths`,
     /// into `choices`; returns their size in bytes.
-    fn matrix(&mut self, vals: &[i64], widths: &[u8], choices: &mut Vec<Block>) -> u64 {
+    fn matrix(&mut self, vals: &[i64], widths: &[u8], choices: &mut [Choice]) -> u64 {
         let n = vals.len();
         self.fill_windows(widths);
         self.sleb_sum.clear();
         self.sleb_sum.push(0);
-        let mut sum = 0u32;
+        let mut sum = 0;
         for &w in widths {
-            sum = sum.wrapping_add(u32::from(w).div_ceil(7));
+            sum += u64::from(w).div_ceil(7);
             self.sleb_sum.push(sum);
         }
         self.walk(vals, choices, |search, i, best| {
@@ -167,9 +278,7 @@ impl Search {
                     break;
                 }
                 let cost = 1 + (bits * m / 8) as u64 + search.cost[i + m];
-                if cost < best.0 {
-                    *best = (cost, Block::Matrix { size, bits });
-                }
+                offer(best, cost, Block::Matrix { size, bits });
             }
         })
     }
@@ -210,7 +319,7 @@ impl Search {
 
     /// Choose `SOC2` blocks for `vals` into `choices`; returns their size
     /// in bytes.
-    fn rice(&mut self, vals: &[i64], choices: &mut Vec<Block>) -> u64 {
+    fn rice(&mut self, vals: &[i64], choices: &mut [Choice]) -> u64 {
         let n = vals.len();
         let u_max = vals.iter().map(|&v| zigzag(v)).max().unwrap_or(0);
         let r_max = bit_len(u_max.min(RICE_U_CAP)).min(MAX_RICE_R);
@@ -220,89 +329,82 @@ impl Search {
         self.sleb_sum.clear();
         self.sleb_sum.push(0);
         self.q_sum.clear();
-        self.q_sum.resize(width, 0);
-        let (mut u_sum, mut sleb_sum) = (0u64, 0u32);
+        self.q_sum.resize((n + 1) * width, 0);
+        let (mut u_sum, mut sleb_sum) = (0u64, 0u64);
         for (i, &v) in vals.iter().enumerate() {
             let u = zigzag(v);
             u_sum = u_sum.wrapping_add(u.min(RICE_U_CAP));
             self.u_sum.push(u_sum);
-            sleb_sum = sleb_sum.wrapping_add(u32::try_from(sleb128_len(v)).unwrap());
+            sleb_sum += sleb128_len(v) as u64;
             self.sleb_sum.push(sleb_sum);
-            for r in 0..width {
-                let q = u32::try_from((u >> r).min(RICE_Q_CAP)).unwrap();
-                let next = self.q_sum[i * width + r].wrapping_add(q + 1);
-                self.q_sum.push(next);
+            let (prev, next) = self.q_sum[i * width..(i + 2) * width].split_at_mut(width);
+            for (r, (next, &prev)) in next.iter_mut().zip(&*prev).enumerate() {
+                #[allow(clippy::cast_possible_truncation)]
+                let q = (u >> r).min(RICE_Q_CAP) as u32;
+                *next = prev.wrapping_add(q + 1);
             }
         }
         self.walk(vals, choices, |search, i, best| {
-            let remaining = n - i;
+            let rice = RiceStep {
+                search,
+                i,
+                remaining: n - i,
+                width,
+                r_max,
+            };
             // The best parameter for one size is a good start for the next.
-            let mut r_start = None;
-            for (size, &m) in RICE_SIZES.iter().enumerate() {
-                if remaining < m {
-                    break;
-                }
-                let mean = search.u_sum[i + m].wrapping_sub(search.u_sum[i]) / m as u64;
-                let r_hi = bit_len(mean).min(r_max);
-                let (qa, qb) = (i * width, (i + m) * width);
-                let bits = |r: usize| {
-                    (r * m) as u64
-                        + u64::from(search.q_sum[qb + r].wrapping_sub(search.q_sum[qa + r]))
-                };
-                // A block's bit count is convex in r, so walk downhill.
-                let start = r_start.map_or(r_hi, |s: usize| s.min(r_hi));
-                let (mut r, mut best_bits) = (start, bits(start));
-                while r > 0 && bits(r - 1) < best_bits {
-                    r -= 1;
-                    best_bits = bits(r);
-                }
-                if r == start {
-                    while r < r_hi && bits(r + 1) < best_bits {
-                        r += 1;
-                        best_bits = bits(r);
-                    }
-                }
-                r_start = Some(r);
-                let cost = 1 + best_bits.div_ceil(8) + search.cost[i + m];
-                if cost < best.0 {
-                    *best = (cost, Block::Rice { size, r });
-                }
-            }
+            // Each size is its own instance, so the mean divides by a
+            // constant.
+            let mut r = None;
+            let _ = rice.size::<0>(&mut r, best)
+                && rice.size::<1>(&mut r, best)
+                && rice.size::<2>(&mut r, best)
+                && rice.size::<3>(&mut r, best)
+                && rice.size::<4>(&mut r, best)
+                && rice.size::<5>(&mut r, best)
+                && rice.size::<6>(&mut r, best);
         })
     }
 
     /// The shortest-path walk shared by both codings: zero runs and SLEB128
     /// runs here, coding-specific blocks from `blocks(self, i, best)`.
-    /// `sleb_sum` must be filled.
+    /// `sleb_sum` must be filled.  Writes one choice per value.
     fn walk(
         &mut self,
         vals: &[i64],
-        choices: &mut Vec<Block>,
-        mut blocks: impl FnMut(&Self, usize, &mut (u64, Block)),
+        choices: &mut [Choice],
+        mut blocks: impl FnMut(&Self, usize, &mut (u64, Choice)),
     ) -> u64 {
         let n = vals.len();
-        choices.clear();
-        choices.resize(n, Block::Unset);
+        assert_eq!(choices.len(), n);
         self.cost.clear();
         self.cost.resize(n + 1, 0);
         let mut zeros = 0;
+        self.sleb_ends.clear();
         for i in (0..n).rev() {
-            let mut best = (u64::MAX, Block::Unset);
+            let mut best = (u64::MAX, Choice::default());
             zeros = if vals[i] == 0 { zeros + 1 } else { 0 };
             // Only the longest zero run: splitting one never helps.
             if zeros > 0 {
                 let cost = 1 + uleb128_len(zeros as u64 - 1) as u64 + self.cost[i + zeros];
-                best = (cost, Block::Zeros(zeros));
+                best = (cost, Choice::from(Block::Zeros(zeros)));
             }
             blocks(self, i, &mut best);
-            let base = self.sleb_sum[i];
-            for len in 1..=MAX_SLEB_RUN.min(n - i) {
-                let bytes = self.sleb_sum[i + len].wrapping_sub(base);
-                let cost = 2 + u64::from(bytes) + self.cost[i + len];
-                if cost < best.0 {
-                    best = (cost, Block::Sleb(len));
-                }
+            // An SLEB128 run to `j` costs `2 + sleb_sum[j] - sleb_sum[i] +
+            // cost[j]`, so the best is the least `sleb_sum[j] + cost[j]`
+            // over the window `i + 1..=i + MAX_SLEB_RUN`: a sliding-window
+            // minimum.  On ties the shortest run wins.
+            let j = i + 1;
+            let g = self.sleb_sum[j] + self.cost[j];
+            while self.sleb_ends.back().is_some_and(|&(_, h)| h >= g) {
+                self.sleb_ends.pop_back();
             }
+            self.sleb_ends.push_back((j, g));
+            if self.sleb_ends[0].0 > i + MAX_SLEB_RUN {
+                self.sleb_ends.pop_front();
+            }
+            let (j, g) = self.sleb_ends[0];
+            offer(&mut best, 2 + g - self.sleb_sum[i], Block::Sleb(j - i));
             self.cost[i] = best.0;
             choices[i] = best.1;
         }
@@ -311,38 +413,79 @@ impl Search {
 }
 
 impl Scratch {
-    /// Bit widths of delta row `order`, computed on first use.
-    fn widths(&mut self, order: usize, n: usize) -> &[u8] {
+    /// Bit widths of delta row `order`, the sum of those of nonzero values,
+    /// and the sum of their SLEB128 lengths, computed on first use.  Rows
+    /// are computed in order.
+    fn widths(&mut self, order: usize, n: usize) {
         let row = order * n..(order + 1) * n;
         if self.widths.len() < row.end {
             self.widths.resize(row.end, 0);
-            for (w, &d) in self.widths[row.clone()]
-                .iter_mut()
-                .zip(&self.deltas[row.clone()])
-            {
+            let (mut bits, mut bytes) = (0, 0);
+            for (w, &d) in self.widths[row.clone()].iter_mut().zip(&self.deltas[row]) {
                 *w = width(d);
+                bits += if d == 0 { 0 } else { u64::from(*w) };
+                bytes += u64::from(*w).div_ceil(7);
             }
+            (self.width_sums[order], self.sleb_sums[order]) = (bits, bytes);
         }
-        &self.widths[row]
+    }
+
+    /// Choose blocks for each run of delta row `order` into `cand`, and
+    /// return their size in bytes plus a byte of initial state per level.
+    fn search_order(&mut self, coding: Coding, order: usize, n: usize) -> u64 {
+        self.cand.clear();
+        self.cand.resize(n, Choice::default());
+        let row = order * n;
+        let mut total = order as u64;
+        for &(start, len) in &self.runs {
+            let range = row + start..row + start + len;
+            let choices = &mut self.cand[start..start + len];
+            total += match coding {
+                Coding::Matrix => {
+                    self.search
+                        .matrix(&self.deltas[range.clone()], &self.widths[range], choices)
+                }
+                Coding::Rice => self.search.rice(&self.deltas[range], choices),
+            };
+        }
+        total
     }
 
     /// Choose the bit-matrix delta order for the `n` coded values, leaving
-    /// its block choices in `best`.  Each order's initial state costs a
-    /// byte per level.
+    /// its block choices in `best`: orders 0, 1, … until two fail to
+    /// improve.  Bounds avoid searching orders whose outcome is known, so
+    /// the choice is the same as searching them all.  Every nonzero value
+    /// costs at least its bit width in any block, which bounds an order's
+    /// cost from below, and coding every value in SLEB128 runs bounds it
+    /// from above.
     fn matrix_order(&mut self, n: usize) -> usize {
         self.widths.clear();
-        self.widths(0, n);
-        let mut best_cost =
-            self.search
-                .matrix(&self.deltas[..n], &self.widths[..n], &mut self.best);
-        let (mut best_order, mut misses) = (0, 0);
-        for order in 1..8.min(n) {
+        let orders = 8.min(n);
+        let runs: u64 = self
+            .runs
+            .iter()
+            .map(|&(_, len)| 2 * len.div_ceil(MAX_SLEB_RUN) as u64)
+            .sum();
+        let lower = |s: &Self, order: usize| order as u64 + s.width_sums[order].div_ceil(8);
+        let upper = |s: &Self, order: usize| order as u64 + s.sleb_sums[order] + runs;
+        let (mut best_cost, mut best_order, mut misses) = (u64::MAX, 0, 0);
+        for order in 0..orders {
             self.widths(order, n);
-            let row = order * n..(order + 1) * n;
-            let cost = order as u64
-                + self
-                    .search
-                    .matrix(&self.deltas[row.clone()], &self.widths[row], &mut self.cand);
+            // If the next order surely beats this one and the best so far,
+            // this one cannot affect the outcome, unless it would be the
+            // second miss in a row that ends the scan.
+            if order + 1 < orders && misses == 0 {
+                self.widths(order + 1, n);
+                let next = upper(self, order + 1);
+                if next < lower(self, order) && next < best_cost {
+                    continue;
+                }
+            }
+            let cost = if lower(self, order) >= best_cost {
+                u64::MAX
+            } else {
+                self.search_order(Coding::Matrix, order, n)
+            };
             if cost < best_cost {
                 std::mem::swap(&mut self.best, &mut self.cand);
                 (best_cost, best_order, misses) = (cost, order, 0);
@@ -359,22 +502,23 @@ impl Scratch {
     /// Choose the split-Rice delta order for the `n` coded values, leaving
     /// its block choices in `best`.
     fn rice_order(&mut self, n: usize) -> usize {
-        let estimates = order_estimates(&self.deltas, n);
+        let order_bits = order_bits(&self.coded);
+        let estimates = order_bits.map(|(bits, _)| bits);
         let guess = best_estimate(&estimates);
-        let row = |order: usize| order * n..(order + 1) * n;
-        let mut best_total =
-            guess as u64 + self.search.rice(&self.deltas[row(guess)], &mut self.best);
+        let mut best_total = self.search_order(Coding::Rice, guess, n);
+        std::mem::swap(&mut self.best, &mut self.cand);
         let mut best_order = guess;
         for step in [-1isize, 1] {
             let mut order = guess;
             while let Some(next) = order.checked_add_signed(step).filter(|&o| o < 8.min(n)) {
                 order = next;
                 #[allow(clippy::cast_precision_loss)]
-                if estimates[order] as f64 > estimates[guess] as f64 * (1.0 + ORDER_MARGIN) {
+                if estimates[order] as f64 > estimates[guess] as f64 * (1.0 + ORDER_MARGIN)
+                    || order_bits[order].1 >= best_total
+                {
                     break;
                 }
-                let total =
-                    order as u64 + self.search.rice(&self.deltas[row(order)], &mut self.cand);
+                let total = self.search_order(Coding::Rice, order, n);
                 if total >= best_total {
                     break;
                 }
@@ -386,19 +530,38 @@ impl Scratch {
     }
 }
 
-/// Estimated bits of each delta order's residuals: their `ZigZag` bit
-/// lengths plus a byte of initial state per level.  Orders `n` and above
-/// do not apply.
-fn order_estimates(deltas: &[i64], n: usize) -> [u64; 8] {
-    let mut estimates = [u64::MAX; 8];
-    for (order, estimate) in estimates.iter_mut().enumerate().take(8.min(n)) {
-        let bits: u64 = deltas[order * n..(order + 1) * n]
-            .iter()
-            .map(|&d| u64::from(64 - zigzag(d).leading_zeros()))
-            .sum();
-        *estimate = 8 * order as u64 + bits;
+/// Estimated bits of each delta order's residuals for `values`: their
+/// `ZigZag` bit lengths plus a byte of initial state per level.  Orders
+/// `values.len()` and above do not apply.  The deltas are computed as they
+/// are summed, in one pass.
+fn order_estimates(values: &[i64]) -> [u64; 8] {
+    order_bits(values).map(|(bits, _)| bits)
+}
+
+/// For each delta order of `values`, as for [`order_estimates`], and a
+/// lower bound in bytes on its split-Rice coding: a nonzero value costs at
+/// least one bit more than its `ZigZag` bit length in any block.
+fn order_bits(values: &[i64]) -> [(u64, u64); 8] {
+    let mut previous = [0i64; 8];
+    let mut bits = [0u64; 8];
+    let mut nonzero = [0u64; 8];
+    for &v in values {
+        let mut d = v;
+        for ((bits, nonzero), previous) in bits.iter_mut().zip(&mut nonzero).zip(&mut previous) {
+            *bits += u64::from(64 - zigzag(d).leading_zeros());
+            *nonzero += u64::from(d != 0);
+            (d, *previous) = (d.wrapping_sub(*previous), d);
+        }
     }
-    estimates
+    let mut out = [(u64::MAX, u64::MAX); 8];
+    for (order, out) in out.iter_mut().enumerate().take(values.len()) {
+        let order_bytes = order as u64;
+        *out = (
+            8 * order_bytes + bits[order],
+            order_bytes + (bits[order] + nonzero[order]).div_ceil(8),
+        );
+    }
+    out
 }
 
 fn best_estimate(estimates: &[u64; 8]) -> usize {
@@ -439,27 +602,36 @@ fn run_len(entries: &[Entry], i: usize) -> usize {
         .count()
 }
 
-/// Gather the coded values of `entries` into `coded`.
-fn gather(entries: &[Entry], coded: &mut Vec<i64>) {
+/// Gather the coded values of `entries` into `coded`, and their runs of
+/// consecutive entries into `runs`.
+fn gather(entries: &[Entry], coded: &mut Vec<i64>, runs: &mut Vec<(usize, usize)>) {
     coded.clear();
-    coded.extend(entries.iter().filter_map(|e| match *e {
-        Entry::Coded(v) => Some(v),
-        _ => None,
-    }));
+    runs.clear();
+    let mut previous_coded = false;
+    for e in entries {
+        if let Entry::Coded(v) = *e {
+            if previous_coded {
+                runs.last_mut().unwrap().1 += 1;
+            } else {
+                runs.push((coded.len(), 1));
+            }
+            coded.push(v);
+        }
+        previous_coded = matches!(e, Entry::Coded(_));
+    }
 }
 
 /// A cheap estimate of the split-Rice packed size of `entries`, in bytes,
 /// to skip coding a `SOC2` candidate that is clearly larger than another.
 pub(crate) fn estimate(entries: &[Entry], scratch: &mut Scratch) -> f64 {
-    gather(entries, &mut scratch.coded);
+    gather(entries, &mut scratch.coded, &mut scratch.runs);
     let n = scratch.coded.len();
     #[allow(clippy::cast_precision_loss)]
     let markers = marker_bytes(entries) as f64;
     if n == 0 {
         return markers;
     }
-    fill_deltas(&scratch.coded, &mut scratch.deltas);
-    let estimates = order_estimates(&scratch.deltas, n);
+    let estimates = order_estimates(&scratch.coded);
     #[allow(clippy::cast_precision_loss)]
     let bits = estimates[best_estimate(&estimates)] as f64;
     bits / 8.0 + markers
@@ -474,7 +646,7 @@ pub(crate) fn encode(
     coding: Coding,
     scratch: &mut Scratch,
 ) {
-    gather(entries, &mut scratch.coded);
+    gather(entries, &mut scratch.coded, &mut scratch.runs);
     let n = scratch.coded.len();
     let mut order = 0;
     if n > 0 {
@@ -513,23 +685,7 @@ pub(crate) fn encode(
             }
             Entry::Coded(_) => {
                 let vals = &scratch.deltas[row + coded..row + coded + run];
-                // The order search chose blocks for all coded values; a
-                // run that is only some of them needs its own.
-                let choices = if run == n {
-                    &scratch.best
-                } else {
-                    match coding {
-                        Coding::Matrix => {
-                            let widths = &scratch.widths[row + coded..row + coded + run];
-                            scratch.search.matrix(vals, widths, &mut scratch.cand);
-                        }
-                        Coding::Rice => {
-                            scratch.search.rice(vals, &mut scratch.cand);
-                        }
-                    }
-                    &scratch.cand
-                };
-                emit(&mut packed, vals, choices);
+                emit(&mut packed, vals, &scratch.best[coded..coded + run]);
                 coded += run;
             }
         }
@@ -541,10 +697,10 @@ pub(crate) fn encode(
 }
 
 /// Append the blocks `choices` picked for `vals`.
-fn emit(out: &mut Vec<u8>, vals: &[i64], choices: &[Block]) {
+fn emit(out: &mut Vec<u8>, vals: &[i64], choices: &[Choice]) {
     let mut i = 0;
     while i < vals.len() {
-        let block = choices[i];
+        let block = choices[i].block();
         let len = block.len();
         let vals = &vals[i..i + len];
         match block {
@@ -587,14 +743,32 @@ fn header(size: usize, low: usize) -> u8 {
 /// Append a bit matrix of `m` values `bits` wide: their bits from most
 /// significant, transposed, each row `m / 8` bytes.
 fn write_matrix(out: &mut Vec<u8>, vals: impl Iterator<Item = u64>, m: usize, bits: usize) {
+    if bits == 0 {
+        return;
+    }
     let start = out.len();
-    out.resize(start + bits * m / 8, 0);
+    let row_bytes = m / 8;
+    out.resize(start + bits * row_bytes, 0);
     let rows = &mut out[start..];
-    for (i, v) in vals.enumerate() {
-        let (col, bit) = (i / 8, 7 - i % 8);
-        for row in 0..bits {
-            let b = (v >> (bits - 1 - row)) & 1;
-            rows[row * m / 8 + col] |= u8::try_from(b).unwrap() << bit;
+    let mut group = [0u64; 8];
+    let mut vals = vals;
+    for col in 0..row_bytes {
+        for v in &mut group {
+            *v = vals.next().unwrap_or(0);
+        }
+        // Each row's byte holds bit `shift` of the eight values.
+        for (row, byte) in rows[col..]
+            .iter_mut()
+            .step_by(row_bytes)
+            .take(bits)
+            .enumerate()
+        {
+            let shift = bits - 1 - row;
+            let mut b = 0u64;
+            for &v in &group {
+                b = b << 1 | (v >> shift) & 1;
+            }
+            *byte = u8::try_from(b).unwrap();
         }
     }
 }
@@ -602,7 +776,8 @@ fn write_matrix(out: &mut Vec<u8>, vals: impl Iterator<Item = u64>, m: usize, bi
 /// Appends bits most significant first, padding the last byte with zeros.
 struct BitWriter<'a> {
     out: &'a mut Vec<u8>,
-    acc: u8,
+    /// The `n` (fewer than 8) bits not yet written, in the low bits.
+    acc: u64,
     n: u32,
 }
 
@@ -611,34 +786,32 @@ impl<'a> BitWriter<'a> {
         Self { out, acc: 0, n: 0 }
     }
 
-    fn bit(&mut self, b: bool) {
-        self.acc = self.acc << 1 | u8::from(b);
-        self.n += 1;
-        if self.n == 8 {
-            self.out.push(self.acc);
-            (self.acc, self.n) = (0, 0);
+    /// The low `len` (at most 56) bits of `value`.
+    fn put(&mut self, value: u64, len: u32) {
+        self.acc = self.acc << len | value;
+        self.n += len;
+        while self.n >= 8 {
+            self.n -= 8;
+            #[allow(clippy::cast_possible_truncation)]
+            self.out.push((self.acc >> self.n) as u8);
         }
+        self.acc &= (1 << self.n) - 1;
     }
 
     /// `q` one bits, then a zero bit.
     fn unary(&mut self, mut q: u64) {
-        while q > 0 && self.n != 0 {
-            self.bit(true);
-            q -= 1;
+        while q >= 48 {
+            self.put((1 << 48) - 1, 48);
+            q -= 48;
         }
-        while q >= 8 {
-            self.out.push(0xFF);
-            q -= 8;
-        }
-        for _ in 0..q {
-            self.bit(true);
-        }
-        self.bit(false);
+        #[allow(clippy::cast_possible_truncation)]
+        self.put(((1 << q) - 1) << 1, q as u32 + 1);
     }
 
     fn finish(self) {
         if self.n > 0 {
-            self.out.push(self.acc << (8 - self.n));
+            #[allow(clippy::cast_possible_truncation)]
+            self.out.push((self.acc << (8 - self.n)) as u8);
         }
     }
 }
@@ -744,6 +917,52 @@ mod tests {
         round_trip(&[Some(5)], 20);
     }
 
+    /// The bounds in `matrix_order` choose as a scan that searches every
+    /// order would: orders 0, 1, … until two in a row fail to improve.
+    #[test]
+    fn matrix_order_bounds_do_not_change_the_choice() {
+        let mut scratch = Scratch::default();
+        let mut columns: Vec<Vec<Entry>> = Vec::new();
+        for seed in 1..40u64 {
+            let degree = seed % 5;
+            let noise_bits = seed % 23;
+            let column = noise(3000, seed)
+                .enumerate()
+                .map(|(i, v)| {
+                    let t = i64::try_from(i).unwrap();
+                    let trend =
+                        (0..=degree).fold(0i64, |acc, _| acc.wrapping_mul(t).wrapping_add(977));
+                    if (i as u64 + seed) % 211 < seed % 7 {
+                        Entry::Absent
+                    } else {
+                        Entry::Coded(trend.wrapping_add(v >> (63 - noise_bits)))
+                    }
+                })
+                .collect();
+            columns.push(column);
+        }
+        for entries in &columns {
+            gather(entries, &mut scratch.coded, &mut scratch.runs);
+            let n = scratch.coded.len();
+            fill_deltas(&scratch.coded, &mut scratch.deltas);
+            let chosen = scratch.matrix_order(n);
+            let (mut best_cost, mut best_order, mut misses) = (u64::MAX, 0, 0);
+            for order in 0..8.min(n) {
+                scratch.widths(order, n);
+                let cost = scratch.search_order(Coding::Matrix, order, n);
+                if cost < best_cost {
+                    (best_cost, best_order, misses) = (cost, order, 0);
+                } else {
+                    misses += 1;
+                    if misses == 2 {
+                        break;
+                    }
+                }
+            }
+            assert_eq!(chosen, best_order);
+        }
+    }
+
     /// Every bit-matrix and split-Rice size and width decodes, alone and
     /// between other blocks.
     #[test]
@@ -763,10 +982,10 @@ mod tests {
                         })
                         .collect();
                     vals.extend([0, 0, 7, -3]);
-                    let mut choices = vec![Block::Unset; vals.len()];
-                    choices[0] = block;
-                    choices[m] = Block::Zeros(2);
-                    choices[m + 2] = Block::Sleb(2);
+                    let mut choices = vec![Choice::default(); vals.len()];
+                    choices[0] = block.into();
+                    choices[m] = Block::Zeros(2).into();
+                    choices[m + 2] = Block::Sleb(2).into();
                     let mut packed = vec![0]; // schema: order 0, no scale
                     emit(&mut packed, &vals, &choices);
                     let mut framed = Vec::new();
