@@ -41,15 +41,12 @@
 //! always resynchronize after a malformed or truncated epoch by scanning for
 //! the next such line.
 
-use std::collections::BTreeMap;
-
 use thiserror::Error;
 
 use crate::model::{
-    add_satellite_epoch, Catalog, EpochRecord, EventRecord, Obs, ObsFile, SatId, SignalFilter,
-    SignalMasks,
+    Catalog, EpochRecord, EventRecord, ObsFile, SatId, SeriesBuilder, SignalFilter, SignalMasks,
 };
-use crate::rinex2_obs::{byte_at, parse_obs_at};
+use crate::rinex2_obs::{byte_at, parse_obs_at, split_lines};
 use crate::rinex_header::{self, Header, HeaderError, HeaderText, ObsCode, SatSystem};
 
 #[derive(Debug, Error)]
@@ -89,7 +86,7 @@ pub fn catalog(input: &[u8]) -> Result<Catalog, Rinex3Error> {
 /// skipped; parsing resumes at the next line starting with `>`.
 pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, Rinex3Error> {
     let text = std::str::from_utf8(input).map_err(|_| Rinex3Error::NotUtf8)?;
-    let lines: Vec<&str> = text.lines().collect();
+    let lines = split_lines(text);
 
     let eoh_idx = lines
         .iter()
@@ -103,7 +100,7 @@ pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, 
     let mut raw_header_text = lines[..=eoh_idx].join("\n");
     raw_header_text.push('\n');
 
-    let header = rinex_header::parse(input)?;
+    let header = rinex_header::parse_str(text)?;
     // An event's `SYS / # / OBS TYPES` records change these.
     let mut codes_by_sys: Vec<Vec<ObsCode>> = codes_by_system(&header)?
         .iter()
@@ -115,10 +112,9 @@ pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, 
     }
 
     let data = &lines[eoh_idx + 1..];
-    let mut observations: BTreeMap<(SatId, ObsCode), Vec<(usize, Obs)>> = BTreeMap::new();
+    let mut series = SeriesBuilder::default();
     let mut epochs: Vec<EpochRecord> = Vec::new();
     let mut events: Vec<(usize, EventRecord)> = Vec::new();
-    let mut satellite_epochs = BTreeMap::new();
 
     let mut pos = 0;
     while pos < data.len() {
@@ -145,8 +141,9 @@ pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, 
                     };
                     let codes = &codes_by_sys[usize::from(sat.system.0)];
                     let keep = masks.get(sat, codes);
+                    let handle = series.satellite(sat);
                     if keep.map_or(true, |keep| keep.contains(&true)) {
-                        add_satellite_epoch(&mut satellite_epochs, sat, epoch_idx);
+                        series.list(handle, epoch_idx);
                     }
                     for (slot, &code) in codes.iter().enumerate() {
                         if keep.is_some_and(|keep| !keep[slot]) {
@@ -155,7 +152,7 @@ pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, 
                         let Some(obs) = parse_obs_at(sat_line, 3 + slot * 16) else {
                             continue;
                         };
-                        let series = observations.entry((sat, code)).or_default();
+                        let series = series.series(handle, slot, code);
                         // Ignore a satellite listed twice in one epoch.
                         if series.last().map_or(true, |&(i, _)| i != epoch_idx) {
                             series.push((epoch_idx, obs));
@@ -178,7 +175,10 @@ pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, 
                     }
                 } else {
                     pos = (pos + epoch.count).min(data.len());
-                    apply_types_change(&data[start..pos], &mut codes_by_sys, &mut masks)?;
+                    if apply_types_change(&data[start..pos], &mut codes_by_sys)? {
+                        masks.reset();
+                        series.reset();
+                    }
                 }
                 let lines = data[start..pos].iter().map(|l| (*l).to_string()).collect();
                 events.push((
@@ -193,6 +193,7 @@ pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, 
         }
     }
 
+    let (observations, satellite_epochs) = series.finish();
     Ok(ObsFile {
         header: HeaderText::from_text(&raw_header_text),
         epochs,
@@ -207,19 +208,19 @@ pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, 
 // ---------------------------------------------------------------------------
 
 /// Apply the `SYS / # / OBS TYPES` records of an event's `lines` to the
-/// code lists of later epochs.
+/// code lists of later epochs.  Returns whether any list changed.
 fn apply_types_change(
     lines: &[&str],
     codes_by_sys: &mut [Vec<ObsCode>],
-    masks: &mut SignalMasks<'_>,
-) -> Result<(), Rinex3Error> {
+) -> Result<bool, Rinex3Error> {
+    let mut changed = false;
     for (sys, codes) in rinex_header::event_obs_codes(lines.iter().copied())?.by_system {
         if let Some(slot) = codes_by_sys.get_mut(usize::from(sys.0)) {
             *slot = codes;
-            masks.reset();
+            changed = true;
         }
     }
-    Ok(())
+    Ok(changed)
 }
 
 /// Check the header's version and index its observation-code lists by

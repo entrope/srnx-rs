@@ -112,15 +112,119 @@ pub struct ObsFile {
     pub satellite_epochs: BTreeMap<SatId, Vec<usize>>,
 }
 
-/// Record that `sat` is listed in epoch `epoch`, once per epoch.
-pub(crate) fn add_satellite_epoch(
-    satellite_epochs: &mut BTreeMap<SatId, Vec<usize>>,
-    sat: SatId,
-    epoch: usize,
-) {
-    let epochs = satellite_epochs.entry(sat).or_default();
-    if epochs.last() != Some(&epoch) {
-        epochs.push(epoch);
+/// Builds [`ObsFile::observations`] and [`ObsFile::satellite_epochs`] for
+/// the text readers, which find a satellite once per epoch record and
+/// then each of its series by position in its code list, rather than
+/// looking up a map once per observation.
+#[derive(Default)]
+pub(crate) struct SeriesBuilder {
+    /// One more than the index into `sats` of each satellite, by system
+    /// letter and PRN; zero for none yet.
+    sat_index: Vec<u32>,
+    sats: Vec<SatSeries>,
+    keys: Vec<(SatId, ObsCode)>,
+    series: Vec<Vec<(usize, Obs)>>,
+    by_key: HashMap<(SatId, ObsCode), u32>,
+}
+
+struct SatSeries {
+    id: SatId,
+    /// The index into `series` for each position in the satellite's code
+    /// list, or `u32::MAX` if not yet looked up.
+    slots: Vec<u32>,
+    epochs: Vec<usize>,
+}
+
+impl SeriesBuilder {
+    /// The handle of satellite `sat`, for the other methods.
+    pub(crate) fn satellite(&mut self, sat: SatId) -> usize {
+        let key = usize::from(sat.system.0) << 8 | usize::from(sat.prn);
+        if self.sat_index.len() <= key {
+            self.sat_index.resize(key + 1, 0);
+        }
+        if self.sat_index[key] == 0 {
+            self.sats.push(SatSeries {
+                id: sat,
+                slots: Vec::new(),
+                epochs: Vec::new(),
+            });
+            self.sat_index[key] = u32::try_from(self.sats.len()).expect("too many satellites");
+        }
+        self.sat_index[key] as usize - 1
+    }
+
+    /// Record that satellite `sat` is listed in epoch `epoch`, once per
+    /// epoch.
+    pub(crate) fn list(&mut self, sat: usize, epoch: usize) {
+        let epochs = &mut self.sats[sat].epochs;
+        if epochs.last() != Some(&epoch) {
+            epochs.push(epoch);
+        }
+    }
+
+    /// The series of satellite `sat` for `code`, at position `slot` of
+    /// its code list.  The same slot must have the same code until
+    /// [`reset`](Self::reset).
+    #[inline]
+    pub(crate) fn series(
+        &mut self,
+        sat: usize,
+        slot: usize,
+        code: ObsCode,
+    ) -> &mut Vec<(usize, Obs)> {
+        let index = match self.sats[sat].slots.get(slot) {
+            Some(&index) if index != u32::MAX => index,
+            _ => self.look_up(sat, slot, code),
+        };
+        &mut self.series[index as usize]
+    }
+
+    /// Find or add the series for [`series`](Self::series), and remember
+    /// it for the slot.
+    #[cold]
+    fn look_up(&mut self, sat: usize, slot: usize, code: ObsCode) -> u32 {
+        let state = &mut self.sats[sat];
+        let next = u32::try_from(self.keys.len()).expect("too many series");
+        let index = *self.by_key.entry((state.id, code)).or_insert(next);
+        if index == next {
+            self.keys.push((state.id, code));
+            self.series.push(Vec::new());
+        }
+        if state.slots.len() <= slot {
+            state.slots.resize(slot + 1, u32::MAX);
+        }
+        state.slots[slot] = index;
+        index
+    }
+
+    /// Forget the series of each slot, after the code lists change.
+    pub(crate) fn reset(&mut self) {
+        for state in &mut self.sats {
+            state.slots.clear();
+        }
+    }
+
+    /// The observations and satellite epochs, without empty entries.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn finish(
+        self,
+    ) -> (
+        BTreeMap<(SatId, ObsCode), Vec<(usize, Obs)>>,
+        BTreeMap<SatId, Vec<usize>>,
+    ) {
+        let observations = self
+            .keys
+            .into_iter()
+            .zip(self.series)
+            .filter(|(_, series)| !series.is_empty())
+            .collect();
+        let satellite_epochs = self
+            .sats
+            .into_iter()
+            .filter(|state| !state.epochs.is_empty())
+            .map(|state| (state.id, state.epochs))
+            .collect();
+        (observations, satellite_epochs)
     }
 }
 

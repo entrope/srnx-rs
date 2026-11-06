@@ -34,12 +34,10 @@
 //! Same layout as a flag-0 epoch.  As in SRNX (which stores them only in
 //! `EVTF`), they become events rather than observation epochs.
 
-use std::collections::BTreeMap;
-
 use thiserror::Error;
 
 use crate::model::{
-    add_satellite_epoch, Catalog, EpochRecord, EventRecord, Obs, ObsFile, SatId, SignalFilter,
+    Catalog, EpochRecord, EventRecord, Obs, ObsFile, SatId, SeriesBuilder, SignalFilter,
     SignalMasks,
 };
 use crate::rinex3_obs::parse_sat_id;
@@ -85,7 +83,7 @@ pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, 
     let text = std::str::from_utf8(input).map_err(|_| Rinex2Error::NotUtf8)?;
 
     // Split into lines (strips the newline character(s)).
-    let lines: Vec<&str> = text.lines().collect();
+    let lines = split_lines(text);
 
     // Locate the END OF HEADER line.
     let eoh_idx = lines
@@ -105,9 +103,9 @@ pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, 
     let mut raw_header_text = lines[..=eoh_idx].join("\n");
     raw_header_text.push('\n');
 
-    // Parse the header section (pass original bytes — the header parser
+    // Parse the header section (pass the whole text — the header parser
     // tolerates trailing data because it stops at END OF HEADER).
-    let header = rinex_header::parse(input).map_err(Rinex2Error::Header)?;
+    let header = rinex_header::parse_str(text).map_err(Rinex2Error::Header)?;
 
     // An event's `# / TYPES OF OBSERV` records change these.
     let mut obs_codes = obs_codes(&header)?.to_vec();
@@ -123,10 +121,9 @@ pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, 
     let base_line = eoh_idx + 1; // for error reporting
 
     // Sparse per-(sat, code) → [(epoch_index, Obs)] list, appended in order.
-    let mut sparse: BTreeMap<(SatId, ObsCode), Vec<(usize, Obs)>> = BTreeMap::new();
+    let mut series = SeriesBuilder::default();
     let mut epochs: Vec<EpochRecord> = Vec::new();
     let mut events: Vec<(usize, EventRecord)> = Vec::new();
-    let mut satellite_epochs = BTreeMap::new();
 
     let mut pos = 0; // index into data_lines
     while pos < data_lines.len() {
@@ -160,6 +157,7 @@ pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, 
                 num_obs = obs_codes.len();
                 obs_lines_per_sat = obs_lines_count(num_obs);
                 masks.reset();
+                series.reset();
             }
             events.push((
                 epoch_idx,
@@ -309,8 +307,9 @@ pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, 
 
         for &sat in &sats {
             let keep = masks.get(sat, &obs_codes);
+            let handle = series.satellite(sat);
             if keep.map_or(true, |keep| keep.contains(&true)) {
-                add_satellite_epoch(&mut satellite_epochs, sat, epoch_idx);
+                series.list(handle, epoch_idx);
             }
             for (obs_line_idx, obs_chunk) in
                 data_lines[pos..pos + obs_lines_per_sat].iter().enumerate()
@@ -322,9 +321,8 @@ pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, 
                         continue;
                     }
                     if let Some(obs) = parse_obs_field(obs_chunk, slot) {
-                        sparse
-                            .entry((sat, code))
-                            .or_default()
+                        series
+                            .series(handle, base_obs + slot, code)
                             .push((epoch_idx, obs));
                     }
                 }
@@ -338,11 +336,12 @@ pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, 
         }
     }
 
+    let (observations, satellite_epochs) = series.finish();
     Ok(ObsFile {
         header: HeaderText::from_text(&raw_header_text),
         epochs,
         events,
-        observations: sparse,
+        observations,
         satellite_epochs,
     })
 }
@@ -366,6 +365,46 @@ fn obs_codes(header: &Header) -> Result<&[ObsCode], Rinex2Error> {
                 .map(|(_, v)| v.as_slice())
         })
         .ok_or(Rinex2Error::NoObsCodes)
+}
+
+/// The lines of `text`, split as [`str::lines`] does but faster: a line
+/// ends at LF, and a CR just before the LF is dropped.
+pub(crate) fn split_lines(text: &str) -> Vec<&str> {
+    let bytes = text.as_bytes();
+    let mut lines = Vec::new();
+    let mut start = 0;
+    while start < bytes.len() {
+        let Some(end) = find_newline(bytes, start) else {
+            lines.push(&text[start..]);
+            break;
+        };
+        let content = if end > start && bytes[end - 1] == b'\r' {
+            end - 1
+        } else {
+            end
+        };
+        lines.push(&text[start..content]);
+        start = end + 1;
+    }
+    lines
+}
+
+/// The index of the first LF in `bytes` at or after `from`, found eight
+/// bytes at a time.
+fn find_newline(bytes: &[u8], from: usize) -> Option<usize> {
+    const ONES: u64 = u64::from_le_bytes([1; 8]);
+    let mut at = from;
+    while let Some(chunk) = bytes.get(at..at + 8) {
+        // A zero byte of `x` sets its high bit in `found`; bits above the
+        // first zero byte may be wrong, but the first is right.
+        let x = u64::from_le_bytes(chunk.try_into().expect("8 bytes")) ^ (ONES * u64::from(b'\n'));
+        let found = x.wrapping_sub(ONES) & !x & (ONES << 7);
+        if found != 0 {
+            return Some(at + found.trailing_zeros() as usize / 8);
+        }
+        at += 8;
+    }
+    bytes[at..].iter().position(|&b| b == b'\n').map(|i| at + i)
 }
 
 /// Number of 80-char observation lines required for `num_obs` obs codes.
@@ -610,13 +649,122 @@ fn parse_obs_field(line: &str, slot: usize) -> Option<Obs> {
 /// integers by skipping the decimal point — no `String` allocation and no
 /// `f64` round-trip.
 pub(crate) fn parse_obs_at(line: &str, start: usize) -> Option<Obs> {
-    // Parse the 14-byte F14.3 value field as an integer (×1000 milliunits).
+    let bytes = line.as_bytes();
+    if let Some(field) = bytes.get(start..start + 16) {
+        parse_obs(field.try_into().expect("16 bytes"))
+    } else {
+        let mut field = [b' '; 16];
+        let rest = bytes.get(start..).unwrap_or(&[]);
+        for (to, &from) in field.iter_mut().zip(rest) {
+            *to = from;
+        }
+        parse_obs(&field)
+    }
+}
+
+const BLANKS: u64 = u64::from_le_bytes([b' '; 8]);
+
+/// [`parse_obs_at`] for a field of exactly 16 bytes.
+#[inline]
+fn parse_obs(field: &[u8; 16]) -> Option<Obs> {
+    let word = |at: usize| u64::from_le_bytes(field[at..at + 8].try_into().expect("8 bytes"));
+    if word(0) == BLANKS && word(6) == BLANKS {
+        return None;
+    }
+    let value = match parse_canonical(field) {
+        Some(value) => value,
+        None => parse_value(field)?,
+    };
+    Some(Obs {
+        value,
+        lli: field[14],
+        ssi: field[15],
+    })
+}
+
+/// The value of an `F14.3` field written as usual: blanks, an optional
+/// `-`, digits, `.` and three more digits.  Returns `None` for any other
+/// field, which [`parse_value`] handles, and gives the same value as it
+/// for these.
+#[inline]
+fn parse_canonical(field: &[u8; 16]) -> Option<i64> {
+    const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+    if field[10] != b'.' {
+        return None;
+    }
+    let frac = [field[11], field[12], field[13]].map(|b| b.wrapping_sub(b'0'));
+    if frac.iter().any(|&d| d > 9) {
+        return None;
+    }
+    let frac = i64::from(frac[0]) * 100 + i64::from(frac[1]) * 10 + i64::from(frac[2]);
+
+    // Columns 3–10 of the integer part, eight at a time.  For ASCII bytes,
+    // `b ^ b'0'` is below 10 just for digits, and adding 0x76 sets the high
+    // bit of the others without carrying into the next byte.
+    let word = u64::from_le_bytes(field[2..10].try_into().expect("8 bytes"));
+    if word & HIGH_BITS != 0 {
+        return None;
+    }
+    let values = word ^ u64::from_le_bytes([b'0'; 8]);
+    let others = ((values + 0x7676_7676_7676_7676) & HIGH_BITS) >> 7;
+    let others = others * 0xFF;
+    // The digits must follow every other byte (the low bytes come first).
+    if others & others.wrapping_add(1) != 0 {
+        return None;
+    }
+    let low = i64::try_from(eight_digits(values & !others)).expect("eight digits");
+    let leading = others.trailing_ones() / 8;
+
+    // Columns 1–2, and the sign.
+    let digit = |b: u8| b.is_ascii_digit().then(|| i64::from(b - b'0'));
+    let mut negative = false;
+    let mut high = 0;
+    if leading == 0 {
+        match (field[0], field[1]) {
+            (b' ', b' ') => {}
+            (b' ', b'-') => negative = true,
+            (b' ', d) => high = digit(d)?,
+            (b'-', d) => {
+                negative = true;
+                high = digit(d)?;
+            }
+            (d, e) => high = digit(d)? * 10 + digit(e)?,
+        }
+    } else {
+        if field[0] != b' ' || field[1] != b' ' {
+            return None;
+        }
+        let blanks = BLANKS & others;
+        if word & others != blanks {
+            let minus = blanks ^ (u64::from(b' ' ^ b'-') << (8 * (leading - 1)));
+            if word & others != minus {
+                return None;
+            }
+            negative = true;
+        }
+    }
+
+    let acc = (high * 100_000_000 + low) * 1000 + frac;
+    Some(if negative { -acc } else { acc })
+}
+
+/// The number written by eight decimal digit values, one per byte, the
+/// most significant in the low byte.
+#[inline]
+fn eight_digits(values: u64) -> u64 {
+    let pairs = (values * (10 << 8 | 1)) >> 8 & 0x00FF_00FF_00FF_00FF;
+    let quads = (pairs * (100 << 16 | 1)) >> 16 & 0x0000_FFFF_0000_FFFF;
+    (quads * (10_000 << 32 | 1)) >> 32
+}
+
+/// The value of any `F14.3` field: its digits as an integer (×1000
+/// milliunits), negated if it has a `-`.  Returns `None` if the field has
+/// no digits or a character other than a digit, blank, `.`, `+` or `-`.
+fn parse_value(field: &[u8; 16]) -> Option<i64> {
     let mut acc: i64 = 0;
     let mut negative = false;
     let mut digits = false;
-
-    for i in 0..14 {
-        let b = byte_at(line, start + i);
+    for &b in &field[..14] {
         match b {
             b'-' => negative = true,
             b'0'..=b'9' => {
@@ -627,17 +775,7 @@ pub(crate) fn parse_obs_at(line: &str, start: usize) -> Option<Obs> {
             _ => return None, // unexpected character → treat as absent
         }
     }
-
-    if !digits {
-        return None;
-    }
-
-    let value = if negative { -acc } else { acc };
-
-    let lli = byte_at(line, start + 14);
-    let ssi = byte_at(line, start + 15);
-
-    Some(Obs { value, lli, ssi })
+    digits.then_some(if negative { -acc } else { acc })
 }
 
 // ---------------------------------------------------------------------------
@@ -660,6 +798,28 @@ mod tests {
         assert_eq!(obs_lines_count(11), 3);
         assert_eq!(obs_lines_count(20), 4);
         assert_eq!(obs_lines_count(21), 5);
+    }
+
+    #[test]
+    fn lines_split_like_str_lines() {
+        for text in [
+            "",
+            "\n",
+            "a",
+            "a\n",
+            "a\r\n",
+            "a\n\n",
+            "\r\n\r\n",
+            "one line that is longer than eight bytes\r\nand another\nlast",
+            "x\ry\r\n\rz",
+            "0123456\n89abcdef\n0123456789abcdef0\r\n",
+        ] {
+            assert_eq!(
+                split_lines(text),
+                text.lines().collect::<Vec<_>>(),
+                "{text:?}"
+            );
+        }
     }
 
     #[test]
@@ -724,6 +884,55 @@ mod tests {
         assert_eq!(obs.ssi, b' ');
         // Second slot is entirely beyond the line.
         assert!(parse_obs_field(line, 1).is_none());
+    }
+
+    /// The fast path agrees with the general parser on every field it
+    /// takes, and takes the usual layouts.
+    #[test]
+    fn canonical_values_match_the_general_parser() {
+        let mut taken = 0;
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let alphabet = b"0123456789     -.+x";
+        for i in 0..400_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let mut field = [b' '; 16];
+            if i % 2 == 0 {
+                // A usual layout: a number of up to 14 places.
+                let digits = 1 + usize::try_from(state % 10).unwrap();
+                let mut n = state >> 8;
+                for at in (0..14).rev() {
+                    if at == 10 {
+                        field[at] = b'.';
+                    } else if at > 10 || 10 - at <= digits {
+                        field[at] = b'0' + u8::try_from(n % 10).unwrap();
+                        n /= 10;
+                    }
+                }
+                let first = field.iter().position(|&b| b != b' ').unwrap();
+                if state & 0x10 != 0 && first > 0 {
+                    field[first - 1] = b'-';
+                }
+            } else {
+                for (at, b) in field[..14].iter_mut().enumerate() {
+                    let pick = (state >> (at * 4)) % alphabet.len() as u64;
+                    *b = alphabet[usize::try_from(pick).unwrap()];
+                }
+            }
+            if let Some(value) = parse_canonical(&field) {
+                taken += 1;
+                assert_eq!(
+                    Some(value),
+                    parse_value(&field),
+                    "{}",
+                    String::from_utf8_lossy(&field)
+                );
+            } else {
+                assert!(i % 2 == 1, "{}", String::from_utf8_lossy(&field));
+            }
+        }
+        assert!(taken >= 200_000, "{taken}");
     }
 
     #[test]

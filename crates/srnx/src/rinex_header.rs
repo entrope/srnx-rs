@@ -393,7 +393,11 @@ pub fn sniff_version(bytes: &[u8]) -> Option<Version> {
 
 #[doc(hidden)]
 pub fn parse(bytes: &[u8]) -> Result<Header, HeaderError> {
-    let text = std::str::from_utf8(bytes).map_err(|_| HeaderError::NotUtf8)?;
+    parse_str(std::str::from_utf8(bytes).map_err(|_| HeaderError::NotUtf8)?)
+}
+
+/// [`parse`] for text already known to be UTF-8.
+pub(crate) fn parse_str(text: &str) -> Result<Header, HeaderError> {
     let mut state = Parser::default();
     let mut version_seen = false;
 
