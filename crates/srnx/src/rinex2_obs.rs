@@ -39,7 +39,8 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 
 use crate::model::{
-    Catalog, EpochRecord, EventRecord, Obs, ObsFile, SatId, SignalFilter, SignalMasks,
+    add_satellite_epoch, Catalog, EpochRecord, EventRecord, Obs, ObsFile, SatId, SignalFilter,
+    SignalMasks,
 };
 use crate::rinex3_obs::parse_sat_id;
 use crate::rinex_header::{self, Header, HeaderError, HeaderText, ObsCode, SatSystem};
@@ -108,13 +109,14 @@ pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, 
     // tolerates trailing data because it stops at END OF HEADER).
     let header = rinex_header::parse(input).map_err(Rinex2Error::Header)?;
 
-    let obs_codes = obs_codes(&header)?;
-    let num_obs = obs_codes.len();
+    // An event's `# / TYPES OF OBSERV` records change these.
+    let mut obs_codes = obs_codes(&header)?.to_vec();
+    let mut num_obs = obs_codes.len();
     let mut masks = SignalMasks::new(filter);
     for &sat in &header.satellites {
-        masks.get(sat, obs_codes);
+        masks.get(sat, &obs_codes);
     }
-    let obs_lines_per_sat = obs_lines_count(num_obs);
+    let mut obs_lines_per_sat = obs_lines_count(num_obs);
 
     // Data starts on the line after END OF HEADER.
     let data_lines = &lines[eoh_idx + 1..];
@@ -124,6 +126,7 @@ pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, 
     let mut sparse: BTreeMap<(SatId, ObsCode), Vec<(usize, Obs)>> = BTreeMap::new();
     let mut epochs: Vec<EpochRecord> = Vec::new();
     let mut events: Vec<(usize, EventRecord)> = Vec::new();
+    let mut satellite_epochs = BTreeMap::new();
 
     let mut pos = 0; // index into data_lines
     while pos < data_lines.len() {
@@ -151,10 +154,18 @@ pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, 
                 .map(|l| (*l).to_string())
                 .collect();
             pos = end;
+            let changed = rinex_header::event_obs_codes(event_lines.iter().map(String::as_str))?;
+            if let Some(codes) = changed.for_system(SatSystem::MIXED) {
+                obs_codes = codes.to_vec();
+                num_obs = obs_codes.len();
+                obs_lines_per_sat = obs_lines_count(num_obs);
+                masks.reset();
+            }
             events.push((
                 epoch_idx,
                 EventRecord {
                     flag,
+                    epoch_line: line.to_owned(),
                     lines: event_lines,
                 },
             ));
@@ -278,6 +289,7 @@ pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, 
                 epochs.len(),
                 EventRecord {
                     flag,
+                    epoch_line: line.to_owned(),
                     lines: data_lines[body_start..pos]
                         .iter()
                         .map(|l| (*l).to_string())
@@ -296,7 +308,10 @@ pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, 
         epochs.push(epoch_rec);
 
         for &sat in &sats {
-            let keep = masks.get(sat, obs_codes);
+            let keep = masks.get(sat, &obs_codes);
+            if keep.map_or(true, |keep| keep.contains(&true)) {
+                add_satellite_epoch(&mut satellite_epochs, sat, epoch_idx);
+            }
             for (obs_line_idx, obs_chunk) in
                 data_lines[pos..pos + obs_lines_per_sat].iter().enumerate()
             {
@@ -328,6 +343,7 @@ pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, 
         epochs,
         events,
         observations: sparse,
+        satellite_epochs,
     })
 }
 
@@ -1005,5 +1021,78 @@ mod tests {
         assert_eq!(obs.epochs.len(), 79);
         assert_eq!(obs.events.len(), 1);
         assert_eq!((obs.events[0].0, obs.events[0].1.flag), (40, 4));
+    }
+
+    /// A file with `before` observation types, a flag-4 event that changes
+    /// them to `after`, and one epoch of `values` (one line of up to five).
+    fn types_change(before: &[&str], after: &[&str], values: &str) -> String {
+        let h = |content: &str, label: &str| format!("{content:<60}{label}\n");
+        let types = |codes: &[&str]| {
+            let list = codes
+                .iter()
+                .map(|c| format!("{c:>6}"))
+                .collect::<Vec<_>>()
+                .concat();
+            h(&format!("{:>6}{list}", codes.len()), "# / TYPES OF OBSERV")
+        };
+        let mut text = h(
+            "     2.11           OBSERVATION DATA    G (GPS)",
+            "RINEX VERSION / TYPE",
+        );
+        text += &types(before);
+        text += &h("", "END OF HEADER");
+        text += " 24 10  1  0  0  0.0000000  0  1G01\n";
+        for line in 0..before.len().div_ceil(5) {
+            let n = (before.len() - 5 * line).min(5);
+            text += &"  20001000.000 6".repeat(n);
+            text += "\n";
+        }
+        text += " 24 10  1  0  0 30.0000000  4  1\n";
+        text += &types(after);
+        text += " 24 10  1  0  1  0.0000000  0  1G01\n";
+        text += values;
+        text += "\n";
+        text
+    }
+
+    #[test]
+    fn events_change_the_observation_types() {
+        let g01 = SatId::new(SatSystem::GPS, 1);
+        let value = |f: &ObsFile, code: &str| {
+            f.observations[&(g01, ObsCode::from_v2(code).unwrap())]
+                .iter()
+                .find(|&&(i, _)| i == 1)
+                .map(|&(_, o)| o.value)
+        };
+        // Fewer lines per satellite after the change.
+        let seven = ["C1", "L1", "L2", "P2", "D1", "S1", "S2"];
+        let text = types_change(&seven, &["C1", "L1"], "  11111111.000 7  22222222.000 7");
+        let f = parse(text.as_bytes(), None).unwrap();
+        assert_eq!(f.epochs.len(), 2);
+        assert_eq!(value(&f, "C1"), Some(11_111_111_000));
+        assert_eq!(value(&f, "L1"), Some(22_222_222_000));
+        assert_eq!(value(&f, "L2"), None);
+        // Reordered: values follow the new order.
+        let text = types_change(
+            &["C1", "L1"],
+            &["L1", "C1"],
+            "  11111111.000 7  22222222.000 7",
+        );
+        let f = parse(text.as_bytes(), None).unwrap();
+        assert_eq!(value(&f, "L1"), Some(11_111_111_000));
+        assert_eq!(value(&f, "C1"), Some(22_222_222_000));
+
+        // A filter is asked once per pair, and applies to the new order.
+        let mut asked = Vec::new();
+        let mut keep_c1 = |_: SatId, code: ObsCode| {
+            asked.push(code);
+            code.as_str() == "C1"
+        };
+        let f = parse(text.as_bytes(), Some(&mut keep_c1)).unwrap();
+        assert_eq!(value(&f, "C1"), Some(22_222_222_000));
+        assert!(!f
+            .observations
+            .contains_key(&(g01, ObsCode::from_v2("L1").unwrap())));
+        assert_eq!(asked.len(), 2);
     }
 }

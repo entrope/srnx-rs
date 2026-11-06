@@ -43,7 +43,7 @@ fn srnx_fixtures() -> Vec<String> {
         .flatten()
         .filter(|name| name.ends_with(".srnx"))
         .collect();
-    assert_eq!(names.len(), 14, "SRNX fixtures: {names:?}");
+    assert_eq!(names.len(), 15, "SRNX fixtures: {names:?}");
     names
 }
 

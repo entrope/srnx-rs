@@ -43,6 +43,21 @@ fn check_filtered(name: &str, bytes: &[u8], keep: fn(SatId, ObsCode) -> bool) {
         "{name}: filter selects everything"
     );
     assert_eq!(part.observations, expected, "{name}: observations");
+    let selected: BTreeSet<SatId> = calls
+        .keys()
+        .filter(|&&(sat, code)| keep(sat, code))
+        .map(|&(sat, _)| sat)
+        .collect();
+    let expected_epochs: BTreeMap<_, _> = full
+        .satellite_epochs
+        .iter()
+        .filter(|(sat, _)| selected.contains(sat))
+        .map(|(sat, epochs)| (*sat, epochs.clone()))
+        .collect();
+    assert_eq!(
+        part.satellite_epochs, expected_epochs,
+        "{name}: satellite epochs"
+    );
     assert_eq!(part.epochs, full.epochs, "{name}: epochs");
     assert_eq!(part.header, full.header, "{name}: header");
     let events = |f: &ObsFile| -> Vec<(usize, Vec<String>)> {
@@ -192,6 +207,7 @@ fn version_is_the_rinex_version_in_every_format() {
         epochs: Vec::new(),
         events: Vec::new(),
         observations: BTreeMap::new(),
+        satellite_epochs: BTreeMap::new(),
     };
     assert_eq!(unversioned.version(), None);
 }

@@ -1,13 +1,13 @@
 # srnx-clean
 
-Clean-room Rust implementation of a **Succinct RINEX (SRNX)** reader, plus
-RINEX v2 and v3/v4 observation readers, a Compact RINEX (Hatanaka) reader,
+Rust implementation of a **Succinct RINEX (SRNX)** reader (clean-room) and
+writer, plus RINEX v2 and v3/v4 observation readers, a Compact RINEX (Hatanaka) reader,
 and a utility to compare two files (SRNX, RINEX or Compact RINEX) for
 semantic equivalence.
 
 ## Clean-room rule
 
-This is a clean-room reimplementation. Do **not** consult any existing SRNX
+The readers are a clean-room reimplementation. Do **not** consult any existing SRNX
 implementation source code (the C reference, helper binaries' source, etc.).
 Allowed inputs are:
 
@@ -19,6 +19,13 @@ Allowed inputs are:
 
 If a question can only be answered by reading the reference source, ask the
 user instead of looking.
+
+The exception is the SRNX writer (`writer.rs`, `pack.rs`, `plan.rs`): for
+it the user has authorized reading the reference encoder,
+`../rinex/bin/rnx2srnx.c`, and the helpers it uses in
+`../rinex/rinex/rnx_priv.h`, and the writer follows its algorithms (block
+choice by shortest path, delta-order search, SOC2 predictor planning).
+The rest of the reference source stays off limits.
 
 The clean-room rule covers SRNX only. For Compact RINEX the user has
 authorized the Hatanaka papers (`~/Documents/GNSS_Specs/Hatanaka_v2_gps96_a2_10.pdf`
@@ -62,6 +69,10 @@ behaviour. **Do not read their source.** Treat them as oracles.
 - `srnx_scan <file.srnx>...` — prints chunk-level summary statistics
   (FOURCC counts, scale factors, delta orders, block-header histogram). Good
   for sanity-checking a parser without exposing observation values.
+- `rnxcmp <a> <b>` — compares two RINEX, CRINEX or SRNX files and exits
+  zero if they are equivalent, nonzero if they differ or one cannot be
+  read.  The writer's output must satisfy both it and `srnx-diff`;
+  `tests/corpus.rs` runs it (override with `$RNXCMP`).
 - `crx2rnx - < in.crx > out.rnx` / `rnx2crx - < in.rnx > out.crx` — RNXCMP
   4.2.0 (source may be read, see above). `crates/srnx/tests/crinex.rs` checks
   our output byte-for-byte against committed `crx2rnx` output, and
@@ -82,6 +93,9 @@ These are easy to miss on a first read of `docs/Succinct_RINEX.md`:
 
 - Integers are **little-endian LEB128**. Signed values use ZigZag (SLEB128).
   `EPOC` interval is signed: negative = seconds, positive = seconds × 1e7.
+  A span step may carry any number of minutes and hours (5-minute data
+  is one span); the writer makes such spans, so readers must handle them.
+  Reference readers before November 2026 carried at most one minute.
   `EPO2` (revision 1.2) is identical except positive intervals and the
   time-of-day are in picoseconds (× 1e12), and SOC2 rate predictors use
   that unit too. A file has at most one of `EPOC`/`EPO2`.
@@ -132,6 +146,11 @@ RINEX text-format gotchas (all versions unless noted):
   chunk (SRNX minor version 2) instead of `EPOC`, and `srnx2rnx` then
   writes the extra digits on every epoch (`00000` where absent).
   `crates/srnx/tests/data/rinex402_picoseconds.rnx` exercises this.
+- A special event's header records may include `# / TYPES OF OBSERV`
+  (v2) or `SYS / # / OBS TYPES` (v3/v4), which change the codes of later
+  epochs; both readers apply them, matching codes by name.  SRNX can only
+  hold codes in its `RHDR`, so the writer (like `rnx2srnx`) rejects a file
+  whose events add a code.
 - v3/v4 observation records are one line per satellite with no 80-column
   limit. Within an epoch, `srnx2rnx` sorts satellites, so line order is not
   semantic.
@@ -183,14 +202,17 @@ Compact RINEX gotchas (`crinex.rs`):
     block-header histograms).
   - Unit tests in `src/` use the fixtures through `crate::test_data` and
     `crate::test_rinex`.
+- `tests/writer.rs`: every fixture written (SOC2 and SOCD, each digest)
+  reads back the same, and is within 2% of `rnx2srnx`'s size.
 - `tests/corpus.rs` (opt-in, `SRNX_CORPUS=<dir>`): converts each file with
   `rnx2srnx` (SOC2 and `--socd`) and compares, decodes with `srnx2rnx`,
-  checks CRINEX against `crx2rnx` and SRNX against `srnx_scan`.
+  checks CRINEX against `crx2rnx` and SRNX against `srnx_scan`, and
+  writes each file with our writer and checks it with `rnxcmp` and
+  `srnx2rnx`.
 - Coverage: `cargo llvm-cov` needs `LLVM_COV`/`LLVM_PROFDATA` pointing at
   Homebrew's LLVM (matching Homebrew's `rustc`), and `--test-threads=1`.
 
 ## Out of scope for MVP
 
-- Writing SRNX (encoder).
 - Writing Hatanaka (`.crx`) files (reading is supported).
 - Streaming/async APIs — MVP is mmap or full read into memory.

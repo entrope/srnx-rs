@@ -2,17 +2,20 @@
 //!
 //! ## API stability
 //!
-//! The public API is [`reader`] and [`model`].  The hidden modules are
+//! The public API is [`reader`], [`writer`] and [`model`].  The hidden modules are
 //! format internals, public only for `srnx-diff` and the integration tests,
 //! and are not covered by semver.
 
 pub mod model;
 pub mod reader;
+pub mod writer;
 
 mod chunk;
 mod compat;
 mod evtf;
 mod leb128;
+mod pack;
+mod plan;
 mod sate;
 mod sdir;
 mod soc2;

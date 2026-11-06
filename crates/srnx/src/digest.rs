@@ -59,6 +59,27 @@ impl DigestId {
         }
     }
 
+    /// The identifier written in the `SRNX` chunk.
+    #[must_use]
+    pub fn raw(self) -> u64 {
+        match self {
+            Self::Null => 0,
+            Self::Crc32c => 2,
+            Self::Blake3_16 => 4,
+            Self::Blake3_32 => 5,
+        }
+    }
+
+    /// Append the digest of `data` (`byte_len()` bytes) to `out`.
+    pub fn append(self, data: &[u8], out: &mut Vec<u8>) {
+        match self {
+            Self::Null => {}
+            Self::Crc32c => out.extend_from_slice(&crc32c::crc32c(data).to_le_bytes()),
+            Self::Blake3_16 => out.extend_from_slice(&blake3::hash(data).as_bytes()[..16]),
+            Self::Blake3_32 => out.extend_from_slice(blake3::hash(data).as_bytes()),
+        }
+    }
+
     /// Compute the digest of `data` and compare it to the first `byte_len()`
     /// bytes of `expected`.
     pub fn verify(self, data: &[u8], expected: &[u8]) -> Result<(), DigestError> {
@@ -97,6 +118,22 @@ mod tests {
         assert_eq!(DigestId::from_raw(1), Err(DigestError::Unknown(1)));
         assert_eq!(DigestId::from_raw(3), Err(DigestError::Unknown(3)));
         assert_eq!(DigestId::from_raw(99), Err(DigestError::Unknown(99)));
+    }
+
+    #[test]
+    fn append_verifies_and_round_trips_raw_ids() {
+        for id in [
+            DigestId::Null,
+            DigestId::Crc32c,
+            DigestId::Blake3_16,
+            DigestId::Blake3_32,
+        ] {
+            let mut out = Vec::new();
+            id.append(b"chunk", &mut out);
+            assert_eq!(out.len(), id.byte_len());
+            assert_eq!(id.verify(b"chunk", &out), Ok(()));
+            assert_eq!(DigestId::from_raw(id.raw()), Ok(id));
+        }
     }
 
     #[test]

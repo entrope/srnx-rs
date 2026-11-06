@@ -68,6 +68,37 @@ pub fn read_sleb128(input: &mut &[u8]) -> Result<i64, LebError> {
     Ok(((u >> 1) as i64) ^ -((u & 1) as i64))
 }
 
+/// Append the ULEB128 encoding of `value` to `out`.
+pub(crate) fn write_uleb128(out: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        out.push(u8::try_from(value & 0x7F).unwrap() | 0x80);
+        value >>= 7;
+    }
+    out.push(u8::try_from(value).unwrap());
+}
+
+/// Append the SLEB128 (`ZigZag`) encoding of `value` to `out`.
+pub(crate) fn write_sleb128(out: &mut Vec<u8>, value: i64) {
+    write_uleb128(out, zigzag(value));
+}
+
+/// The `ZigZag` mapping of `value`: even for non-negative, odd for negative.
+#[allow(clippy::cast_sign_loss)]
+pub(crate) const fn zigzag(value: i64) -> u64 {
+    ((value << 1) ^ (value >> 63)) as u64
+}
+
+/// Length in bytes of the ULEB128 encoding of `value`.
+pub(crate) const fn uleb128_len(value: u64) -> usize {
+    let bits = 64 - (value | 1).leading_zeros();
+    bits.div_ceil(7) as usize
+}
+
+/// Length in bytes of the SLEB128 encoding of `value`.
+pub(crate) const fn sleb128_len(value: i64) -> usize {
+    uleb128_len(zigzag(value))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,6 +113,22 @@ mod tests {
         let mut cursor = bytes;
         let v = read_sleb128(&mut cursor)?;
         Ok((v, bytes.len() - cursor.len()))
+    }
+
+    #[test]
+    fn writers_round_trip() {
+        for v in [0, 1, 127, 128, 300, 16_383, 16_384, u64::MAX / 3, u64::MAX] {
+            let mut out = Vec::new();
+            write_uleb128(&mut out, v);
+            assert_eq!(out.len(), uleb128_len(v), "{v}");
+            assert_eq!(decode_u(&out), Ok((v, out.len())));
+        }
+        for v in [0, 1, -1, 63, -64, 64, -65, i64::MAX, i64::MIN] {
+            let mut out = Vec::new();
+            write_sleb128(&mut out, v);
+            assert_eq!(out.len(), sleb128_len(v), "{v}");
+            assert_eq!(decode_s(&out), Ok((v, out.len())));
+        }
     }
 
     #[test]

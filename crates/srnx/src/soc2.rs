@@ -282,7 +282,8 @@ pub fn parse(mut cursor: &[u8]) -> Result<Soc2, Soc2Error> {
     })
 }
 
-fn rounded(num: i128, den: i128) -> Result<i128, Soc2Error> {
+/// `num / den` rounded to the nearest integer, ties away from zero.
+pub(crate) fn rounded(num: i128, den: i128) -> Result<i128, Soc2Error> {
     if den <= 0 {
         return Err(Soc2Error::Invalid("nonpositive predictor denominator"));
     }
@@ -295,20 +296,15 @@ fn rounded(num: i128, den: i128) -> Result<i128, Soc2Error> {
     }
 }
 
-fn prediction(
+/// The prediction `p[k]` in milli-units, or `None` if it is not available.
+/// `milli(i)` is the reference value at satellite epoch `i`, if present.
+pub(crate) fn prediction(
     p: Predictor,
     k: usize,
-    reference: &Socd,
+    milli: impl Fn(usize) -> Option<i128>,
     times: &[i128],
     units_per_second: u64,
 ) -> Result<Option<i128>, Soc2Error> {
-    let milli = |i: usize| {
-        reference
-            .values
-            .get(i)
-            .filter(|&&v| v != ABSENT)
-            .map(|&v| i128::from(v) * i128::from(reference.scale))
-    };
     let (numerator, den) = match p {
         Predictor::None => return Ok(None),
         Predictor::Value { num, den, .. } => {
@@ -665,7 +661,15 @@ fn apply_prediction(
             continue;
         }
         let p = reference
-            .map(|r| prediction(predictor, k, r, times, units_per_second))
+            .map(|r| {
+                prediction(
+                    predictor,
+                    k,
+                    |i| reference_milli(r, i),
+                    times,
+                    units_per_second,
+                )
+            })
             .transpose()?
             .flatten();
         if unpredicted[k] != p.is_none() {
@@ -689,6 +693,15 @@ fn apply_prediction(
         }
     }
     Ok(data)
+}
+
+/// Value `i` of a decoded reference column in milli-units, if present.
+fn reference_milli(reference: &Socd, i: usize) -> Option<i128> {
+    reference
+        .values
+        .get(i)
+        .filter(|&&v| v != ABSENT)
+        .map(|&v| i128::from(v) * i128::from(reference.scale))
 }
 
 #[cfg(test)]
@@ -922,7 +935,10 @@ mod tests {
                 max_span: 0,
             };
             for (k, exp) in expected.into_iter().enumerate() {
-                assert_eq!(prediction(p, k, &reference, &times, U7).unwrap(), exp);
+                assert_eq!(
+                    prediction(p, k, |i| reference_milli(&reference, i), &times, U7).unwrap(),
+                    exp
+                );
             }
         }
         let p = Predictor::Rate {
@@ -932,13 +948,22 @@ mod tests {
             stencil: 0,
             max_span: 10_000_000,
         };
-        assert_eq!(prediction(p, 1, &reference, &times, U7).unwrap(), Some(30));
-        assert_eq!(prediction(p, 2, &reference, &times, U7).unwrap(), None);
+        assert_eq!(
+            prediction(p, 1, |i| reference_milli(&reference, i), &times, U7).unwrap(),
+            Some(30)
+        );
+        assert_eq!(
+            prediction(p, 2, |i| reference_milli(&reference, i), &times, U7).unwrap(),
+            None
+        );
         let mut missing = reference.clone();
         missing.values[1] = ABSENT;
-        assert_eq!(prediction(p, 1, &missing, &times, U7).unwrap(), None);
         assert_eq!(
-            prediction(p, 1, &reference, &[0, 0, 1, 2], U7).unwrap(),
+            prediction(p, 1, |i| reference_milli(&missing, i), &times, U7).unwrap(),
+            None
+        );
+        assert_eq!(
+            prediction(p, 1, |i| reference_milli(&reference, i), &[0, 0, 1, 2], U7).unwrap(),
             None
         );
     }
@@ -955,8 +980,14 @@ mod tests {
             max_span: 0,
         };
         let times = [0, 1_000_000_000_000, 3_000_000_000_000];
-        assert_eq!(prediction(p, 1, &reference, &times, U12).unwrap(), Some(30));
-        assert_eq!(prediction(p, 2, &reference, &times, U12).unwrap(), Some(30));
+        assert_eq!(
+            prediction(p, 1, |i| reference_milli(&reference, i), &times, U12).unwrap(),
+            Some(30)
+        );
+        assert_eq!(
+            prediction(p, 2, |i| reference_milli(&reference, i), &times, U12).unwrap(),
+            Some(30)
+        );
     }
 
     #[test]
@@ -970,11 +1001,24 @@ mod tests {
             stencil: 0,
             max_span: 0,
         };
-        assert!(prediction(p, 1, &reference, &[0, U7.into()], U7)
-            .unwrap()
-            .is_some());
+        assert!(prediction(
+            p,
+            1,
+            |i| reference_milli(&reference, i),
+            &[0, U7.into()],
+            U7
+        )
+        .unwrap()
+        .is_some());
         assert_eq!(
-            prediction(p, 1, &reference, &[0, U12.into()], U12).unwrap(),
+            prediction(
+                p,
+                1,
+                |i| reference_milli(&reference, i),
+                &[0, U12.into()],
+                U12
+            )
+            .unwrap(),
             None
         );
     }
@@ -1096,12 +1140,12 @@ mod tests {
             den: cast_unsigned(i64::MAX),
         };
         assert_eq!(
-            prediction(p, 0, &reference, &[0], U7).unwrap(),
+            prediction(p, 0, |i| reference_milli(&reference, i), &[0], U7).unwrap(),
             Some(i128::from(i64::MAX))
         );
         let reference = data(&[i64::MAX], 1_000_000_000);
         assert_eq!(
-            prediction(p, 0, &reference, &[0], U7),
+            prediction(p, 0, |i| reference_milli(&reference, i), &[0], U7),
             Err(Soc2Error::Overflow)
         );
         let columns = [

@@ -21,9 +21,10 @@ below; those are under their sources' terms.
 These were written for this project. Each `.crx` was made from the `.rnx` by
 `RNX2CRX` (RNXCMP 4.2.0), and each `.crx.rnx` is the output of `CRX2RNX`
 4.2.0 on the `.crx`. `make_fixtures.py` makes `.srnx` and `.scan` files for
-`crinex_v304_features`, `rinex211_flag1_flag6` and `rinex402_picoseconds`;
-`rnx2srnx` rejects `crinex_v211_features`, and `rinex402_table_a4_variants`
-has a truncated epoch.
+`crinex_v211_features`, `crinex_v304_features`, `rinex211_flag1_flag6` and
+`rinex402_picoseconds`.  `rinex402_table_a4_variants` has none: it has a
+truncated epoch and a BeiDou satellite without `SYS / # / OBS TYPES`, which
+`rnx2srnx` rejects, and it has no `.crx` either.
 
 ## Excerpts of station data
 

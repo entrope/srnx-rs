@@ -1,10 +1,10 @@
 # srnx-rs
 
-srnx-rs is a Rust package for reading SRNX files.
+srnx-rs is a Rust package for reading and writing SRNX files.
 SRNX is a succinct format for representing GNSS observation data that is
 semantically equivalent to standard RINEX observation-file formats.
 srnx-rs does not read navigation messages or meteorological data files,
-and does not write files.
+and writes only SRNX.
 
 This library can read observation files formatted as:
 
@@ -30,10 +30,14 @@ This returns an `srnx::model::ObsFile`, which contains:
 
 - the file header, normalized to linefeed endings, with lookup by label;
 - a vector of flag-0 observation epoch metadata;
-- a vector of flag-1 through flag-6 special event records, with their
-  respective (non-decreasing) indexes into the observation epochs; and
+- a vector of flag-1 through flag-6 special event records (epoch line
+  and following lines), with their respective (non-decreasing) indexes
+  into the observation epochs;
 - a map of (satellite, observation code) -> observation lists, with
-  each observation list containing tuples of epoch index and observations.
+  each observation list containing tuples of epoch index and observations;
+  and
+- a map of satellite -> the epochs that list it, including epochs where
+  all of its observations are blank.
 
 The map does not preserve the original order of satellites within an epoch.
 Observation values are returned as i64 integers counting milli-units,
@@ -52,6 +56,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+`srnx::writer::write()` writes an `ObsFile` as SRNX, so reading any
+supported format and writing the result converts it to SRNX.
+`srnx::writer::write_with()` takes `WriteOptions`: `SOC2` (the default,
+SRNX 1.1) or `SOCD` (SRNX 1.0) observation chunks, the chunk and file
+digests, and the number of threads to encode satellites on.
+The writer follows the reference encoder, `rnx2srnx`, and its output is
+the same size or slightly smaller.
+
+```rust,no_run
+use std::io::{BufWriter, Write};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let file = srnx::reader::read(&std::fs::read("abmf1190.26o")?)?;
+    let mut out = BufWriter::new(std::fs::File::create("abmf1190.srnx")?);
+    srnx::writer::write(&file, &mut out)?;
+    out.flush()?;
+    Ok(())
+}
+```
+
 ## crate `srnx-diff`
 
 This crate builds a `srnx-diff` executable that compares two RINEX-ish
@@ -61,6 +85,8 @@ not relevant (end-of-line conventions, trailing whitespace, order of
 satellites per epoch, and so forth).
 An observation written as 0.000 differs from a blank one, and an LLI or
 SSI of 0 differs from a blank one.
+A satellite listed in an epoch with only blank observations differs from
+one not listed.
 
 Usage:
 

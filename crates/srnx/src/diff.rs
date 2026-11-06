@@ -80,6 +80,7 @@ pub fn compare(a: &ObsFile, b: &ObsFile, label_a: &str, label_b: &str) -> Vec<St
     compare_headers(a, b, label_a, label_b, &mut out);
     compare_epochs(a, b, label_a, label_b, &mut out);
     compare_events(a, b, label_a, label_b, &mut out);
+    compare_satellite_epochs(a, b, label_a, label_b, &mut out);
     compare_observations(a, b, label_a, label_b, &mut out);
     out
 }
@@ -164,6 +165,13 @@ fn compare_events(a: &ObsFile, b: &ObsFile, label_a: &str, label_b: &str, out: &
             out.push(format!("event[{k}] position: epoch[{ia}] vs epoch[{ib}]"));
         } else if ea.flag != eb.flag {
             out.push(format!("event[{k}] flag: {} vs {}", ea.flag, eb.flag));
+        } else if !epoch_lines_eq(&ea.epoch_line, &eb.epoch_line) {
+            out.push(format!(
+                "event[{k}] (flag {}) epoch line differs: {label_a}={:?} {label_b}={:?}",
+                ea.flag,
+                ea.epoch_line.trim_end(),
+                eb.epoch_line.trim_end()
+            ));
         } else if !ea
             .lines
             .iter()
@@ -178,6 +186,67 @@ fn compare_events(a: &ObsFile, b: &ObsFile, label_a: &str, label_b: &str, out: &
             ));
         }
     }
+}
+
+/// Satellites listed in different epochs, including epochs where all of a
+/// satellite's observations are blank.
+fn compare_satellite_epochs(
+    a: &ObsFile,
+    b: &ObsFile,
+    label_a: &str,
+    label_b: &str,
+    out: &mut Vec<String>,
+) {
+    let sats: BTreeSet<_> = a
+        .satellite_epochs
+        .keys()
+        .chain(b.satellite_epochs.keys())
+        .collect();
+    for sat in sats {
+        let none = Vec::new();
+        let ea = a.satellite_epochs.get(sat).unwrap_or(&none);
+        let eb = b.satellite_epochs.get(sat).unwrap_or(&none);
+        let (mut ia, mut ib) = (0, 0);
+        while out.len() < MAX_DIFFS && (ia < ea.len() || ib < eb.len()) {
+            let (i, file, label) = match (ea.get(ia), eb.get(ib)) {
+                (Some(x), Some(y)) if x == y => {
+                    ia += 1;
+                    ib += 1;
+                    continue;
+                }
+                (Some(&x), y) if y.map_or(true, |&y| x < y) => {
+                    ia += 1;
+                    (x, a, label_a)
+                }
+                (_, Some(&y)) => {
+                    ib += 1;
+                    (y, b, label_b)
+                }
+                _ => unreachable!(),
+            };
+            let time = file.epochs.get(i).map_or_else(String::new, fmt_epoch);
+            out.push(format!(
+                "{sat} listed in epoch[{i}] {time}: only in {label}"
+            ));
+        }
+    }
+}
+
+/// Event epoch lines compare field by field, so the leading zero that
+/// `crx2rnx` leaves off values below one (`-.123`) does not matter.
+fn epoch_lines_eq(a: &str, b: &str) -> bool {
+    fn field(t: &str) -> String {
+        if let Some(rest) = t.strip_prefix("0.") {
+            format!(".{rest}")
+        } else if let Some(rest) = t.strip_prefix("-0.") {
+            format!("-.{rest}")
+        } else {
+            t.to_owned()
+        }
+    }
+    a.split_whitespace()
+        .map(field)
+        .eq(b.split_whitespace().map(field))
 }
 
 fn compare_observations(
@@ -345,7 +414,34 @@ mod tests {
             epochs: vec![epoch],
             events,
             observations: value.map(|v| (key, obs(v))).into_iter().collect(),
+            // Listed even without a value: every field blank.
+            satellite_epochs: [(key.0, vec![0])].into_iter().collect(),
         }
+    }
+
+    #[test]
+    fn epoch_lines_compare_by_field() {
+        let line = "> 2024 10 01 00 00  4.0000000  1  2       0.000000123856";
+        assert!(epoch_lines_eq(
+            line,
+            "> 2024 10 01 00 00  4.0000000  1  2        .000000123856"
+        ));
+        assert!(epoch_lines_eq("  -0.5", "-.5  "));
+        assert!(!epoch_lines_eq(
+            line,
+            "> 2024 10 01 00 00  4.0000000  1  2       0.000000123857"
+        ));
+    }
+
+    #[test]
+    fn satellite_epochs_are_compared() {
+        let a = file(Vec::new(), None);
+        let mut b = file(Vec::new(), None);
+        b.satellite_epochs.clear();
+        assert_eq!(
+            compare(&a, &b, "a", "b"),
+            ["G01 listed in epoch[0] 2024-10-01 00:00:00.0000000: only in a"]
+        );
     }
 
     #[test]
@@ -358,17 +454,23 @@ mod tests {
 
     #[test]
     fn events_are_compared() {
-        let event = |at, flag, line: &str| {
+        let event_at = |at, flag, epoch_line: &str, line: &str| {
             (
                 at,
                 EventRecord {
                     flag,
+                    epoch_line: epoch_line.to_owned(),
                     lines: vec![line.to_owned()],
                 },
             )
         };
+        let epoch_line = "                            4  1";
+        let event = |at, flag, line: &str| event_at(at, flag, epoch_line, line);
         let a = file(vec![event(1, 4, "COMMENT")], Some(1));
-        let same = file(vec![event(1, 4, "COMMENT   ")], Some(1));
+        let same = file(
+            vec![event_at(1, 4, &format!("{epoch_line}  "), "COMMENT   ")],
+            Some(1),
+        );
         assert_eq!(compare(&a, &same, "a", "b"), [] as [String; 0]);
         for (b, want) in [
             (file(Vec::new(), Some(1)), "event count: a=1  b=0"),
@@ -379,6 +481,11 @@ mod tests {
             (
                 file(vec![event(1, 3, "COMMENT")], Some(1)),
                 "event[0] flag: 4 vs 3",
+            ),
+            (
+                file(vec![event_at(1, 4, "  4  2", "COMMENT")], Some(1)),
+                "event[0] (flag 4) epoch line differs: \
+                 a=\"                            4  1\" b=\"  4  2\"",
             ),
             (
                 file(vec![event(1, 4, "COMMENTS")], Some(1)),

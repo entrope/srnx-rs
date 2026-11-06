@@ -94,6 +94,7 @@ pub fn read(bytes: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, S
 
     let mut observations: BTreeMap<(SatId, ObsCode), Vec<(usize, Obs)>> = BTreeMap::new();
     let mut masks = SignalMasks::new(filter);
+    let mut satellite_epochs = BTreeMap::new();
 
     for entry in &sdir.satellites {
         let sat_id = parse_sat_id(entry.sat_id);
@@ -109,6 +110,7 @@ pub fn read(bytes: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, S
 
         let sate = file.sate_at(sate_file_offset, num_obs_codes, total_epochs)?;
         let present = &sate.present_epoch_indices;
+        satellite_epochs.insert(sat_id, present.clone());
 
         let times: Vec<i128> = present.iter().map(|&i| timestamps[i]).collect();
         let mut load = |code_idx: usize| -> Result<Option<Column>, FileError> {
@@ -167,6 +169,7 @@ pub fn read(bytes: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, S
         epochs,
         events,
         observations,
+        satellite_epochs,
     })
 }
 
@@ -198,8 +201,14 @@ fn events(
             b @ b'1'..=b'6' => b - b'0',
             _ => return Err(bad("epoch flag is not 1 to 6")),
         };
-        let lines = lines.map(str::to_owned).collect();
-        events.push((epoch_index, EventRecord { flag, lines }));
+        events.push((
+            epoch_index,
+            EventRecord {
+                flag,
+                epoch_line: epoch_line.to_owned(),
+                lines: lines.map(str::to_owned).collect(),
+            },
+        ));
     }
     Ok(events)
 }
@@ -215,7 +224,7 @@ fn open(bytes: &[u8]) -> Result<SrnxFile<'_>, SrnxReadError> {
 // Gregorian day numbers, plus any leap seconds represented by the epoch
 // chunk, in units of `1 / units_per_second` s. A leap second remains in its
 // day's final minute and shifts all later days by 1 s.
-fn continuous_times(epochs: &[Epoch], units_per_second: u64) -> Vec<i128> {
+pub(crate) fn continuous_times(epochs: &[Epoch], units_per_second: u64) -> Vec<i128> {
     let mut leap_days = std::collections::BTreeSet::new();
     let day_number = |e: &Epoch| {
         let year = i128::from(e.year) - 1;
@@ -305,7 +314,7 @@ fn parse_sat_id(bytes: [u8; 3]) -> SatId {
 ///
 /// For v2 MIXED files, all satellites share the single MIXED list.
 /// For v3 files, each satellite system has its own list.
-fn obs_codes_for_sat(header: &Header, system: SatSystem) -> &[ObsCode] {
+pub(crate) fn obs_codes_for_sat(header: &Header, system: SatSystem) -> &[ObsCode] {
     if let Some(codes) = header.obs_codes.for_system(SatSystem::MIXED) {
         return codes;
     }

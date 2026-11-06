@@ -46,7 +46,8 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 
 use crate::model::{
-    Catalog, EpochRecord, EventRecord, Obs, ObsFile, SatId, SignalFilter, SignalMasks,
+    add_satellite_epoch, Catalog, EpochRecord, EventRecord, Obs, ObsFile, SatId, SignalFilter,
+    SignalMasks,
 };
 use crate::rinex2_obs::{byte_at, parse_obs_at};
 use crate::rinex_header::{self, Header, HeaderError, HeaderText, ObsCode, SatSystem};
@@ -103,16 +104,21 @@ pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, 
     raw_header_text.push('\n');
 
     let header = rinex_header::parse(input)?;
-    let codes_by_sys = codes_by_system(&header)?;
+    // An event's `SYS / # / OBS TYPES` records change these.
+    let mut codes_by_sys: Vec<Vec<ObsCode>> = codes_by_system(&header)?
+        .iter()
+        .map(|c| c.to_vec())
+        .collect();
     let mut masks = SignalMasks::new(filter);
     for &sat in &header.satellites {
-        masks.get(sat, codes_by_sys[usize::from(sat.system.0)]);
+        masks.get(sat, &codes_by_sys[usize::from(sat.system.0)]);
     }
 
     let data = &lines[eoh_idx + 1..];
     let mut observations: BTreeMap<(SatId, ObsCode), Vec<(usize, Obs)>> = BTreeMap::new();
     let mut epochs: Vec<EpochRecord> = Vec::new();
     let mut events: Vec<(usize, EventRecord)> = Vec::new();
+    let mut satellite_epochs = BTreeMap::new();
 
     let mut pos = 0;
     while pos < data.len() {
@@ -137,8 +143,11 @@ pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, 
                     let Some(sat) = parse_sat_id(sat_line) else {
                         continue;
                     };
-                    let codes = codes_by_sys[usize::from(sat.system.0)];
+                    let codes = &codes_by_sys[usize::from(sat.system.0)];
                     let keep = masks.get(sat, codes);
+                    if keep.map_or(true, |keep| keep.contains(&true)) {
+                        add_satellite_epoch(&mut satellite_epochs, sat, epoch_idx);
+                    }
                     for (slot, &code) in codes.iter().enumerate() {
                         if keep.is_some_and(|keep| !keep[slot]) {
                             continue;
@@ -169,9 +178,17 @@ pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, 
                     }
                 } else {
                     pos = (pos + epoch.count).min(data.len());
+                    apply_types_change(&data[start..pos], &mut codes_by_sys, &mut masks)?;
                 }
                 let lines = data[start..pos].iter().map(|l| (*l).to_string()).collect();
-                events.push((epochs.len(), EventRecord { flag, lines }));
+                events.push((
+                    epochs.len(),
+                    EventRecord {
+                        flag,
+                        epoch_line: line.to_owned(),
+                        lines,
+                    },
+                ));
             }
         }
     }
@@ -181,12 +198,29 @@ pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, 
         epochs,
         events,
         observations,
+        satellite_epochs,
     })
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Apply the `SYS / # / OBS TYPES` records of an event's `lines` to the
+/// code lists of later epochs.
+fn apply_types_change(
+    lines: &[&str],
+    codes_by_sys: &mut [Vec<ObsCode>],
+    masks: &mut SignalMasks<'_>,
+) -> Result<(), Rinex3Error> {
+    for (sys, codes) in rinex_header::event_obs_codes(lines.iter().copied())?.by_system {
+        if let Some(slot) = codes_by_sys.get_mut(usize::from(sys.0)) {
+            *slot = codes;
+            masks.reset();
+        }
+    }
+    Ok(())
+}
 
 /// Check the header's version and index its observation-code lists by
 /// system letter.  The first declaration wins, matching
@@ -725,5 +759,41 @@ mod tests {
         let c1c = ObsCode::from_v3("C1C").unwrap();
         let &(i, o) = f.observations[&(g05, c1c)].first().unwrap();
         assert_eq!((i, o.value, o.lli, o.ssi), (0, 25_053_222_110, b' ', b' '));
+    }
+
+    #[test]
+    fn events_change_the_observation_types() {
+        let h = |content: &str, label: &str| format!("{content:<60}{label}\n");
+        let mut text = h(
+            "     3.04           OBSERVATION DATA    M",
+            "RINEX VERSION / TYPE",
+        );
+        text += &h("G    3 C1C L1C S1C", "SYS / # / OBS TYPES");
+        text += &h("E    1 C1C", "SYS / # / OBS TYPES");
+        text += &h("", "END OF HEADER");
+        text += "> 2024 10 01 00 00  0.0000000  0  2\n";
+        text += "G01  20001000.000 6 100005000.000 6        45.000\n";
+        text += "E02  30001000.000\n";
+        text += "> 2024 10 01 00 00  0.5000000  4  1\n";
+        text += &h("G    2 S1C C1C", "SYS / # / OBS TYPES");
+        text += "> 2024 10 01 00 00  1.0000000  0  2\n";
+        text += "G01        46.000    20001001.000 6\n";
+        text += "E02  30001001.000\n";
+        let f = parse(text.as_bytes(), None).unwrap();
+        let value = |sat: SatId, code: &str| {
+            f.observations[&(sat, ObsCode::from_v3(code).unwrap())]
+                .iter()
+                .find(|&&(i, _)| i == 1)
+                .map(|&(_, o)| o.value)
+        };
+        let g01 = SatId::new(SatSystem::GPS, 1);
+        assert_eq!(value(g01, "S1C"), Some(46_000));
+        assert_eq!(value(g01, "C1C"), Some(20_001_001_000));
+        assert_eq!(value(g01, "L1C"), None);
+        // Other systems keep their codes.
+        assert_eq!(
+            value(SatId::new(SatSystem::GALILEO, 2), "C1C"),
+            Some(30_001_001_000)
+        );
     }
 }

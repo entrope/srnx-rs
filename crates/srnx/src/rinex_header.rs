@@ -498,6 +498,35 @@ pub fn parse(bytes: &[u8]) -> Result<Header, HeaderError> {
     Err(HeaderError::NoEndOfHeader)
 }
 
+/// The observation codes declared by the header records of a special event
+/// (flags 2–5): its `# / TYPES OF OBSERV` (RINEX 2) or `SYS / # / OBS TYPES`
+/// (RINEX 3 and 4) records, which change the codes of the epochs after it.
+/// Empty if it has none.
+pub(crate) fn event_obs_codes<'a>(
+    lines: impl IntoIterator<Item = &'a str>,
+) -> Result<ObsCodes, HeaderError> {
+    let mut state = Parser::default();
+    let mut last = "";
+    for line in lines {
+        let label = split_label(line).map_or("", |(_, label)| label);
+        if !last.is_empty() && label != last {
+            state.finalize_pending_obs(last)?;
+        }
+        last = "";
+        if let Some((content, label)) = split_label(line) {
+            if label == LABEL_OBS_TYPES_V2 {
+                state.handle_obs_v2_line(content)?;
+                last = LABEL_OBS_TYPES_V2;
+            } else if label == LABEL_OBS_TYPES_V3 {
+                state.handle_obs_v3_line(content)?;
+                last = LABEL_OBS_TYPES_V3;
+            }
+        }
+    }
+    state.finalize_pending_obs(last)?;
+    Ok(state.header.obs_codes)
+}
+
 // ---------------------------------------------------------------------------
 // Parser state
 // ---------------------------------------------------------------------------

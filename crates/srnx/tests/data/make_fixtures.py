@@ -156,8 +156,10 @@ FIXTURES = [
 
 
 # Hand-written fixtures (not excerpts) that also get an SRNX version.
-# rnx2srnx rejects crinex_v211_features.
+# rnx2srnx rejects rinex402_table_a4_variants, which has a truncated epoch
+# and a satellite of a system without SYS / # / OBS TYPES.
 SMALL = [
+    "crinex_v211_features",
     "crinex_v304_features",
     "rinex211_flag1_flag6",
     "rinex402_picoseconds",

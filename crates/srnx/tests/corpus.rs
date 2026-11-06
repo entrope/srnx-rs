@@ -10,6 +10,11 @@
 //! - Our Compact RINEX decompression must match `crx2rnx` byte for byte.
 //! - SRNX files must match `srnx2rnx`'s decoding and `srnx_scan`'s
 //!   statistics.
+//! - Every file is written as SRNX with our writer, both with `SOC2` and
+//!   `SOCD` chunks.  Our reading of the result must match the source, and
+//!   so must `rnxcmp`'s comparison of the two files (`$RNXCMP` overrides
+//!   it; files `rnxcmp` cannot read are not compared), and `srnx2rnx` must
+//!   decode it.
 //!
 //! Files in other formats are skipped, as are files the reference tools
 //! reject (if we reject them too).  Every file is checked, and the test
@@ -26,6 +31,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use srnx::crinex;
 use srnx::model::ObsFile;
 use srnx::reader::{self, Format};
+use srnx::writer::{self, ObsChunk, WriteOptions};
 
 /// A temporary file, removed when dropped.
 struct TempFile(PathBuf);
@@ -99,6 +105,39 @@ fn check_rinex(path: &Path, source: &ObsFile) -> Result<(), String> {
     Ok(())
 }
 
+/// Write `source` (read from `path`) with our writer and compare.
+fn check_writer(path: &Path, source: &ObsFile) -> Result<(), String> {
+    let rnxcmp = std::env::var_os("RNXCMP").unwrap_or_else(|| "rnxcmp".into());
+    // rnxcmp exits nonzero for files it cannot read, as for differences.
+    let comparable = tool(&rnxcmp, &[path, path], None)?.is_some();
+    if !comparable {
+        eprintln!(
+            "{}: rnxcmp cannot read it; not comparing with rnxcmp",
+            path.display()
+        );
+    }
+    for obs_chunk in [ObsChunk::Soc2, ObsChunk::Socd] {
+        let label = format!("our {obs_chunk:?} output");
+        let mut options = WriteOptions::default();
+        options.obs_chunk = obs_chunk;
+        let mut bytes = Vec::new();
+        writer::write_with(source, &options, &mut bytes)
+            .map_err(|e| format!("{}: {label}: {e}", path.display()))?;
+        let written = read(&bytes, &label);
+        common::assert_same(source, &written, &path.display().to_string(), &label);
+        let srnx = TempFile::new("srnx");
+        std::fs::write(&srnx.0, &bytes).unwrap();
+        if comparable && tool(&rnxcmp, &[path, &srnx.0], None)?.is_none() {
+            return Err(format!(
+                "{}: rnxcmp finds {label} different",
+                path.display()
+            ));
+        }
+        check_srnx2rnx(&srnx.0, &written, &label)?;
+    }
+    Ok(())
+}
+
 fn check_crinex(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let program = std::env::var_os("CRX2RNX").unwrap_or_else(|| "crx2rnx".into());
     let Some(want) = tool(program, &[Path::new("-")], Some(path))? else {
@@ -161,15 +200,21 @@ fn check_file(path: &Path) -> Result<bool, String> {
             ))
         }
     };
-    match format {
-        Format::Srnx => check_srnx(path, &bytes, &file)?,
-        Format::Crinex => {
-            check_crinex(path, &bytes)?;
-            check_rinex(path, &file)?;
-        }
-        _ => check_rinex(path, &file)?,
-    }
+    check_reader(path, &bytes, format, &file)?;
+    check_writer(path, &file)?;
     Ok(true)
+}
+
+fn check_reader(path: &Path, bytes: &[u8], format: Format, file: &ObsFile) -> Result<(), String> {
+    match format {
+        Format::Srnx => check_srnx(path, bytes, file)?,
+        Format::Crinex => {
+            check_crinex(path, bytes)?;
+            check_rinex(path, file)?;
+        }
+        _ => check_rinex(path, file)?,
+    }
+    Ok(())
 }
 
 #[test]

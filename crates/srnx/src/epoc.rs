@@ -266,7 +266,13 @@ fn interval_to_units(interval: i64, units: u64) -> Result<i64, EpocError> {
 }
 
 #[allow(clippy::cast_possible_truncation)]
-fn advance_time(hour: &mut u8, minute: &mut u8, seconds: &mut u64, interval: i64, units: u64) {
+pub(crate) fn advance_time(
+    hour: &mut u8,
+    minute: &mut u8,
+    seconds: &mut u64,
+    interval: i64,
+    units: u64,
+) {
     let new_s = i128::from(*seconds) + i128::from(interval);
     if new_s < 0 {
         *seconds = 0;
@@ -383,6 +389,28 @@ mod tests {
         assert_eq!(e.epochs[60].seconds_e7, 0);
         assert_eq!(e.epochs[69].minute, 1);
         assert_eq!(e.epochs[69].seconds_e7, 9 * 10_000_000);
+    }
+
+    #[test]
+    fn steps_carry_several_minutes_and_hours() {
+        // 5-minute and 5-hour intervals in one span each: every step
+        // carries more than one minute, as the spec requires readers to do.
+        let p = build_payload(3, &[(-300, 2, 20_241_001, 0)], &[]);
+        let e = parse(&p, EpochChunkKind::Epoc).unwrap();
+        let hm: Vec<(u8, u8)> = e.epochs.iter().map(|e| (e.hour, e.minute)).collect();
+        assert_eq!(hm, [(0, 0), (0, 5), (0, 10)]);
+        let start = 55 * 1_000_000_000 + 30 * 10_000_000; // 00:55:30
+        let p = build_payload(3, &[(-5 * 3600 - 90, 2, 20_241_001, start)], &[]);
+        let e = parse(&p, EpochChunkKind::Epoc).unwrap();
+        let hms: Vec<(u8, u8, u64)> = e
+            .epochs
+            .iter()
+            .map(|e| (e.hour, e.minute, e.seconds_e7))
+            .collect();
+        assert_eq!(
+            hms,
+            [(0, 55, 300_000_000), (5, 57, 0), (10, 58, 300_000_000)]
+        );
     }
 
     #[test]

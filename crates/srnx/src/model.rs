@@ -66,14 +66,16 @@ pub struct EpochRecord {
     pub clock_offset_e12: i64,
 }
 
-/// Raw text lines accompanying a special-event epoch record (flag 1–6).
-///
-/// For flags 1 and 6 these are the record's satellite continuation lines
-/// (RINEX v2) and observation / cycle-slip lines.
+/// A special-event epoch record (flag 1–6), as raw text.
 #[derive(Debug, Clone)]
 pub struct EventRecord {
     pub flag: u8,
-    /// The verbatim lines that follow the epoch header.
+    /// The verbatim epoch header line (the `>` line in RINEX v3/v4), which
+    /// has the event's time, if any, and its flag.
+    pub epoch_line: String,
+    /// The verbatim lines that follow the epoch header.  For flags 1 and 6
+    /// these are the record's satellite continuation lines (RINEX v2) and
+    /// observation / cycle-slip lines.
     pub lines: Vec<String>,
 }
 
@@ -102,6 +104,24 @@ pub struct ObsFile {
     /// order.  Epochs where the observation is absent are simply omitted.
     /// Use binary search on the first element for O(log n) lookup by epoch.
     pub observations: BTreeMap<(SatId, ObsCode), Vec<(usize, Obs)>>,
+    /// For each satellite, the indices of the epochs whose records list it,
+    /// ascending.  A satellite may be listed in an epoch without any
+    /// observations (every field blank), so this can have epochs that
+    /// `observations` does not.  With a filter, only satellites with at
+    /// least one selected signal are listed.
+    pub satellite_epochs: BTreeMap<SatId, Vec<usize>>,
+}
+
+/// Record that `sat` is listed in epoch `epoch`, once per epoch.
+pub(crate) fn add_satellite_epoch(
+    satellite_epochs: &mut BTreeMap<SatId, Vec<usize>>,
+    sat: SatId,
+    epoch: usize,
+) {
+    let epochs = satellite_epochs.entry(sat).or_default();
+    if epochs.last() != Some(&epoch) {
+        epochs.push(epoch);
+    }
 }
 
 impl ObsFile {
@@ -175,6 +195,9 @@ pub type SignalFilter<'a> = &'a mut dyn FnMut(SatId, ObsCode) -> bool;
 pub(crate) struct SignalMasks<'f> {
     filter: Option<SignalFilter<'f>>,
     masks: HashMap<SatId, Vec<bool>>,
+    /// Every answer of `filter`, so it is asked once per pair even when
+    /// the masks are rebuilt.
+    answers: HashMap<(SatId, ObsCode), bool>,
 }
 
 impl<'f> SignalMasks<'f> {
@@ -182,18 +205,31 @@ impl<'f> SignalMasks<'f> {
         Self {
             filter,
             masks: HashMap::new(),
+            answers: HashMap::new(),
         }
     }
 
-    /// Which of `codes` to keep for `sat`; `None` keeps them all.  A
-    /// satellite always gets the same code list, so the first call's mask
-    /// is reused.
+    /// Which of `codes` to keep for `sat`; `None` keeps them all.  Until
+    /// [`reset`](Self::reset), a satellite gets the same code list, so the
+    /// first call's mask is reused.
     pub(crate) fn get(&mut self, sat: SatId, codes: &[ObsCode]) -> Option<&[bool]> {
         let filter = self.filter.as_mut()?;
-        let mask = self
-            .masks
-            .entry(sat)
-            .or_insert_with(|| codes.iter().map(|&code| filter(sat, code)).collect());
+        let answers = &mut self.answers;
+        let mask = self.masks.entry(sat).or_insert_with(|| {
+            codes
+                .iter()
+                .map(|&code| {
+                    *answers
+                        .entry((sat, code))
+                        .or_insert_with(|| filter(sat, code))
+                })
+                .collect()
+        });
         Some(mask)
+    }
+
+    /// Forget the masks, after the code lists change.
+    pub(crate) fn reset(&mut self) {
+        self.masks.clear();
     }
 }
