@@ -12,7 +12,7 @@ license = "Unlicense"
 repository = "https://github.com/entrope/srnx-rs.git"
 
 [workspace.dependencies]
-srnx = { path = "crates/srnx", version = "0.1.0-rc.2" }
+srnx = { path = "crates/srnx", version = "0.1.0-rc.3" }
 blake3 = "1"
 crc32c = "0.6"
 thiserror = "2"

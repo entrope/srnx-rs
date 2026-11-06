@@ -106,5 +106,5 @@ This allows using `--quiet` for automated testing or CI.
 You can use `srnx` in a Cargo manifest by including something like this:
 
 ```text
-srnx = { git = "https://github.com/entrope/srnx-rs", tag = "v0.1.0-rc.2" }
+srnx = { git = "https://github.com/entrope/srnx-rs", tag = "v0.1.0-rc.3" }
 ```
