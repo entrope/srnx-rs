@@ -22,6 +22,8 @@ pub enum SdirError {
     Leb(#[from] LebError),
     #[error("SDIR truncated reading {what}")]
     Truncated { what: &'static str },
+    #[error("SDIR lists satellite {0:?} more than once")]
+    DuplicateSatellite(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +45,7 @@ pub fn parse(payload: &[u8]) -> Result<Sdir, SdirError> {
     let epoc_offset = read_uleb128(&mut cursor)?;
     let evtf_offset = read_uleb128(&mut cursor)?;
     let mut satellites = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     while !cursor.is_empty() {
         let (sat_id_arr, rest) = split_first_chunk::<3>(cursor).ok_or(SdirError::Truncated {
             what: "satellite id",
@@ -50,6 +53,13 @@ pub fn parse(payload: &[u8]) -> Result<Sdir, SdirError> {
         let sat_id = *sat_id_arr;
         cursor = rest;
         let sate_offset = read_uleb128(&mut cursor)?;
+        // "A given satellite name MUST be used in at most one SATE chunk",
+        // so a second entry would repeat its observations.
+        if !seen.insert(sat_id) {
+            return Err(SdirError::DuplicateSatellite(
+                String::from_utf8_lossy(&sat_id).into_owned(),
+            ));
+        }
         satellites.push(SatelliteEntry {
             sat_id,
             sate_offset,
@@ -119,6 +129,15 @@ mod tests {
         assert_eq!(sdir.satellites[0].sate_offset, 100);
         assert_eq!(&sdir.satellites[3].sat_id, b"E12");
         assert_eq!(sdir.satellites[3].sate_offset, 25_668_000);
+    }
+
+    #[test]
+    fn parse_rejects_duplicate_satellites() {
+        let bytes = build(0, 0, &[(b"G01", 100), (b"G02", 200), (b"G01", 300)]);
+        assert_eq!(
+            parse(&bytes),
+            Err(SdirError::DuplicateSatellite("G01".to_string()))
+        );
     }
 
     #[test]

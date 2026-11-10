@@ -41,6 +41,8 @@
 //! always resynchronize after a malformed or truncated epoch by scanning for
 //! the next such line.
 
+use std::collections::HashSet;
+
 use thiserror::Error;
 
 use crate::model::{
@@ -118,6 +120,7 @@ pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, 
     let mut epochs: Vec<EpochRecord> = Vec::new();
     let mut events: Vec<(usize, EventRecord)> = Vec::new();
     let mut skipped_records = 0_usize;
+    let mut seen_sats: HashSet<SatId> = HashSet::new();
 
     let mut pos = 0;
     while pos < data.len() {
@@ -133,6 +136,7 @@ pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, 
 
         match epoch.record.flag {
             0 => {
+                seen_sats.clear();
                 let epoch_idx = epochs.len();
                 epochs.push(epoch.record);
                 for _ in 0..epoch.count {
@@ -148,6 +152,12 @@ pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, 
                         skipped_records += 1;
                         continue;
                     };
+                    // A satellite listed twice in one epoch is malformed; keep
+                    // its first record, as the RINEX v2 reader does.
+                    if !seen_sats.insert(sat) {
+                        skipped_records += 1;
+                        continue;
+                    }
                     let codes = &codes_by_sys[usize::from(sat.system.0)];
                     let keep = masks.get(sat, codes);
                     let handle = series.satellite(sat);
@@ -161,11 +171,7 @@ pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, 
                         let Some(obs) = parse_obs_at(sat_line, 3 + slot * 16) else {
                             continue;
                         };
-                        let series = series.series(handle, slot, code);
-                        // Ignore a satellite listed twice in one epoch.
-                        if series.last().map_or(true, |&(i, _)| i != epoch_idx) {
-                            series.push((epoch_idx, obs));
-                        }
+                        series.series(handle, slot, code).push((epoch_idx, obs));
                     }
                 }
             }
@@ -804,6 +810,42 @@ mod tests {
             assert_eq!(f.events.len(), 1);
             assert_eq!(f.skipped_records, 1, "{text}");
         }
+    }
+
+    #[test]
+    fn a_duplicate_satellite_keeps_its_first_record() {
+        let h = |content: &str, label: &str| format!("{content:<60}{label}\n");
+        let mut text = h(
+            "     3.04           OBSERVATION DATA    M",
+            "RINEX VERSION / TYPE",
+        );
+        text += &h("G    1 C1C", "SYS / # / OBS TYPES");
+        text += &h("", "END OF HEADER");
+        text += "> 2024 10 01 00 00  0.0000000  0  2\n";
+        text += "G01  20000000.000\nG01  20000001.000\n";
+        let f = parse(text.as_bytes(), None).unwrap();
+        assert_eq!(f.epochs.len(), 1);
+        assert_eq!(f.skipped_records, 1);
+        assert_eq!(obs(&f, "G01", "C1C"), vec![(0, 20_000_000_000, b' ', b' ')]);
+    }
+
+    #[test]
+    fn a_duplicate_code_is_an_error() {
+        // Both slots would feed one (satellite, code) series, giving it two
+        // values for the epoch.
+        let h = |content: &str, label: &str| format!("{content:<60}{label}\n");
+        let mut text = h(
+            "     3.04           OBSERVATION DATA    M",
+            "RINEX VERSION / TYPE",
+        );
+        text += &h("G    2 C1C C1C", "SYS / # / OBS TYPES");
+        text += &h("", "END OF HEADER");
+        text += "> 2024 10 01 00 00  0.0000000  0  1\n";
+        text += "G01  20000000.000  20000001.000\n";
+        assert!(matches!(
+            parse(text.as_bytes(), None),
+            Err(Rinex3Error::Header(HeaderError::DuplicateObsCode { .. }))
+        ));
     }
 
     // ---- fixture tests -----------------------------------------------

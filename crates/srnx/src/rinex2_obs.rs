@@ -34,6 +34,8 @@
 //! Same layout as a flag-0 epoch.  As in SRNX (which stores them only in
 //! `EVTF`), they become events rather than observation epochs.
 
+use std::collections::HashSet;
+
 use thiserror::Error;
 
 use crate::model::{
@@ -125,6 +127,7 @@ pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, 
     let mut epochs: Vec<EpochRecord> = Vec::new();
     let mut events: Vec<(usize, EventRecord)> = Vec::new();
     let mut skipped_records = 0_usize;
+    let mut seen_sats: HashSet<SatId> = HashSet::new();
 
     let mut pos = 0; // index into data_lines
     while pos < data_lines.len() {
@@ -311,10 +314,21 @@ pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, 
         }
 
         // Normal epoch (flag 0): parse observation records.
+        //
+        // A satellite listed twice in one epoch is malformed; keep its first
+        // record, as the RINEX v3 reader and rnx2srnx do, and report the rest.
+        seen_sats.clear();
+        let duplicated: Vec<bool> = sats.iter().map(|&sat| !seen_sats.insert(sat)).collect();
+        skipped_records += duplicated.iter().filter(|&&d| d).count();
+
         let epoch_idx = epochs.len();
         epochs.push(epoch_rec);
 
-        for &sat in &sats {
+        for (&sat, &duplicate) in sats.iter().zip(&duplicated) {
+            if duplicate {
+                pos += obs_lines_per_sat;
+                continue;
+            }
             let keep = masks.get(sat, &obs_codes);
             let handle = series.satellite(sat);
             if keep.map_or(true, |keep| keep.contains(&true)) {
@@ -1137,6 +1151,29 @@ mod tests {
         assert_eq!(f.epochs.len(), 1);
         assert_eq!(f.events.len(), 1);
         assert_eq!(f.skipped_records, 1);
+    }
+
+    #[test]
+    fn a_duplicate_satellite_keeps_its_first_record() {
+        let h = |content: &str, label: &str| format!("{content:<60}{label}\n");
+        let text = h(
+            "     2.11           OBSERVATION DATA    G (GPS)",
+            "RINEX VERSION / TYPE",
+        ) + &h("     1    C1", "# / TYPES OF OBSERV")
+            + &h("", "END OF HEADER")
+            + " 24 10  1  0  0  0.0000000  0  2G01G01\n  20000000.000\n  20000001.000\n";
+        let f = parse(text.as_bytes(), None).unwrap();
+        assert_eq!(f.epochs.len(), 1);
+        assert_eq!(f.skipped_records, 1);
+        let key = (
+            SatId::new(SatSystem::GPS, 1),
+            ObsCode::from_v2("C1").unwrap(),
+        );
+        let got: Vec<(usize, i64)> = f.observations[&key]
+            .iter()
+            .map(|&(i, o)| (i, o.value))
+            .collect();
+        assert_eq!(got, [(0, 20_000_000_000)]);
     }
 
     #[test]

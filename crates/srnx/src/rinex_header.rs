@@ -155,6 +155,8 @@ pub enum HeaderError {
     },
     #[error("obs-codes continuation line with no preceding declaration")]
     OrphanObsContinuation,
+    #[error("obs code {code} declared twice for system {system:?}")]
+    DuplicateObsCode { system: Option<u8>, code: String },
 }
 
 /// A RINEX format version.  `minor` is the number formed by the two digits
@@ -531,6 +533,29 @@ pub(crate) fn event_obs_codes<'a>(
     Ok(state.header.obs_codes)
 }
 
+/// Check a completed obs-code declaration: it has the declared number of
+/// codes, and no code twice.  Every reader keys observations by satellite
+/// and code, so a repeated code would give one series two values per epoch
+/// (`rnx2srnx` rejects such a file too).
+fn check_codes(system: Option<u8>, expected: usize, codes: &[ObsCode]) -> Result<(), HeaderError> {
+    if codes.len() != expected {
+        return Err(HeaderError::ObsCountMismatch {
+            system,
+            expected,
+            actual: codes.len(),
+        });
+    }
+    for (i, code) in codes.iter().enumerate() {
+        if codes[..i].contains(code) {
+            return Err(HeaderError::DuplicateObsCode {
+                system,
+                code: code.as_str().to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Parser state
 // ---------------------------------------------------------------------------
@@ -559,19 +584,7 @@ impl Parser {
 
         if !count_str.is_empty() {
             // New v2 obs-codes block: finalize any prior one first.
-            if let Some((expected, codes)) = self.obs_v2.take() {
-                if codes.len() != expected {
-                    return Err(HeaderError::ObsCountMismatch {
-                        system: None,
-                        expected,
-                        actual: codes.len(),
-                    });
-                }
-                self.header
-                    .obs_codes
-                    .by_system
-                    .push((SatSystem::MIXED, codes));
-            }
+            self.finalize_v2()?;
             let expected: usize = count_str.parse().map_err(|_| HeaderError::Malformed {
                 label: "# / TYPES OF OBSERV",
                 detail: format!("count {count_str:?}"),
@@ -650,15 +663,20 @@ impl Parser {
         Ok(())
     }
 
+    fn finalize_v2(&mut self) -> Result<(), HeaderError> {
+        if let Some((expected, codes)) = self.obs_v2.take() {
+            check_codes(None, expected, &codes)?;
+            self.header
+                .obs_codes
+                .by_system
+                .push((SatSystem::MIXED, codes));
+        }
+        Ok(())
+    }
+
     fn finalize_v3_current(&mut self) -> Result<(), HeaderError> {
         if let Some((sys, expected, codes)) = self.obs_v3_current.take() {
-            if codes.len() != expected {
-                return Err(HeaderError::ObsCountMismatch {
-                    system: Some(sys.0),
-                    expected,
-                    actual: codes.len(),
-                });
-            }
+            check_codes(Some(sys.0), expected, &codes)?;
             self.header.obs_codes.by_system.push((sys, codes));
         }
         Ok(())
@@ -666,21 +684,7 @@ impl Parser {
 
     fn finalize_pending_obs(&mut self, last_label: &str) -> Result<(), HeaderError> {
         match last_label {
-            LABEL_OBS_TYPES_V2 => {
-                if let Some((expected, codes)) = self.obs_v2.take() {
-                    if codes.len() != expected {
-                        return Err(HeaderError::ObsCountMismatch {
-                            system: None,
-                            expected,
-                            actual: codes.len(),
-                        });
-                    }
-                    self.header
-                        .obs_codes
-                        .by_system
-                        .push((SatSystem::MIXED, codes));
-                }
-            }
+            LABEL_OBS_TYPES_V2 => self.finalize_v2()?,
             LABEL_OBS_TYPES_V3 => self.finalize_v3_current()?,
             _ => {}
         }
@@ -1029,6 +1033,34 @@ mod tests {
                 actual: 2
             }
         ));
+    }
+
+    #[test]
+    fn rejects_duplicate_codes() {
+        for (version, types) in [
+            (
+                "     2.11           OBSERVATION DATA    G                   ",
+                line(
+                    "     3    L1    C1    L1                                    ",
+                    "# / TYPES OF OBSERV",
+                ),
+            ),
+            (
+                "     3.04           OBSERVATION DATA    M                   ",
+                line("G    2 C1C C1C", "SYS / # / OBS TYPES"),
+            ),
+        ] {
+            let header = build(&[
+                &line(version, "RINEX VERSION / TYPE"),
+                &types,
+                &line("", "END OF HEADER"),
+            ]);
+            let err = parse(header.as_bytes()).unwrap_err();
+            assert!(
+                matches!(&err, HeaderError::DuplicateObsCode { code, .. } if code == "L1" || code == "C1C"),
+                "{err:?}"
+            );
+        }
     }
 
     #[test]
