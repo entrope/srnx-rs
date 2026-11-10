@@ -114,12 +114,12 @@ pub fn read(bytes: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, S
         }
 
         let sate = file.sate_at(sate_file_offset, num_obs_codes, total_epochs)?;
-        let present = &sate.present_epoch_indices;
-        satellite_epochs.insert(sat_id, present.clone());
+        let present = sate.present_epoch_indices;
+        let offsets = sate.socd_offsets;
 
         let times: Vec<i128> = present.iter().map(|&i| timestamps[i]).collect();
         let mut load = |code_idx: usize| -> Result<Option<Column>, FileError> {
-            let rel_offset = sate.socd_offsets[code_idx];
+            let rel_offset = offsets[code_idx];
             if rel_offset == 0 {
                 return Ok(None);
             }
@@ -177,6 +177,8 @@ pub fn read(bytes: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, S
                 series.push((ep_idx, Obs { value, lli, ssi }));
             }
         }
+        // The list is the model's own; it is moved rather than cloned.
+        satellite_epochs.insert(sat_id, present);
     }
 
     Ok(ObsFile {
