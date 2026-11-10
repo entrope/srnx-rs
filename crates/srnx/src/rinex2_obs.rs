@@ -750,11 +750,16 @@ fn parse_canonical(field: &[u8; 16]) -> Option<i64> {
 
 /// The number written by eight decimal digit values, one per byte, the
 /// most significant in the low byte.
+///
+/// Each multiplication overflows `u64` by design: the windows kept by the
+/// masks never receive a carry, and the discarded high part holds only the
+/// most significant byte/word of the product, so the low 64 bits are exact.
+/// The multiplies are `wrapping_mul` to keep debug builds from panicking.
 #[inline]
 fn eight_digits(values: u64) -> u64 {
-    let pairs = (values * (10 << 8 | 1)) >> 8 & 0x00FF_00FF_00FF_00FF;
-    let quads = (pairs * (100 << 16 | 1)) >> 16 & 0x0000_FFFF_0000_FFFF;
-    (quads * (10_000 << 32 | 1)) >> 32
+    let pairs = values.wrapping_mul(10 << 8 | 1) >> 8 & 0x00FF_00FF_00FF_00FF;
+    let quads = pairs.wrapping_mul(100 << 16 | 1) >> 16 & 0x0000_FFFF_0000_FFFF;
+    quads.wrapping_mul(10_000 << 32 | 1) >> 32
 }
 
 /// The value of any `F14.3` field: its digits as an integer (×1000
@@ -844,6 +849,11 @@ mod tests {
         assert_eq!(obs2.value, 99_935_750_108);
         assert_eq!(obs2.lli, b'4');
         assert_eq!(obs2.ssi, b'2');
+
+        // Largest canonical field: ten integer digits, the first a digit
+        // (some writers put a digit in the spec's sign column).
+        let obs4 = parse_obs_field("9999999999.999  ", 0).unwrap();
+        assert_eq!(obs4.value, 9_999_999_999_999);
     }
 
     #[test]
