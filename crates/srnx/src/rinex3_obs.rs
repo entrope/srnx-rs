@@ -83,7 +83,9 @@ pub fn catalog(input: &[u8]) -> Result<Catalog, Rinex3Error> {
 /// satellite/signal pairs that `filter` selects (all of them for `None`).
 ///
 /// Both LF and CRLF line endings are accepted.  Malformed epoch records are
-/// skipped; parsing resumes at the next line starting with `>`.
+/// skipped and counted in [`ObsFile::skipped_records`]; parsing resumes at
+/// the next line starting with `>`.
+#[allow(clippy::too_many_lines)]
 pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, Rinex3Error> {
     let text = std::str::from_utf8(input).map_err(|_| Rinex3Error::NotUtf8)?;
     let lines = split_lines(text);
@@ -115,6 +117,7 @@ pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, 
     let mut series = SeriesBuilder::default();
     let mut epochs: Vec<EpochRecord> = Vec::new();
     let mut events: Vec<(usize, EventRecord)> = Vec::new();
+    let mut skipped_records = 0_usize;
 
     let mut pos = 0;
     while pos < data.len() {
@@ -122,6 +125,9 @@ pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, 
         pos += 1;
         // Stray or malformed lines: skip until the next valid epoch record.
         let Some(epoch) = parse_epoch_line(line) else {
+            if !line.trim().is_empty() {
+                skipped_records += 1;
+            }
             continue;
         };
 
@@ -130,13 +136,16 @@ pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, 
                 let epoch_idx = epochs.len();
                 epochs.push(epoch.record);
                 for _ in 0..epoch.count {
-                    // A `>` line inside the block means this epoch was
-                    // truncated; keep what we have and resume there.
+                    // A `>` line inside the block, or the end of the file,
+                    // means this epoch was truncated; keep what we have,
+                    // report it, and resume there.
                     let Some(&sat_line) = data.get(pos).filter(|l| !l.starts_with('>')) else {
+                        skipped_records += 1;
                         break;
                     };
                     pos += 1;
                     let Some(sat) = parse_sat_id(sat_line) else {
+                        skipped_records += 1;
                         continue;
                     };
                     let codes = &codes_by_sys[usize::from(sat.system.0)];
@@ -180,6 +189,10 @@ pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, 
                         series.reset();
                     }
                 }
+                if pos - start < epoch.count {
+                    // Truncated by the end of the file or the next epoch.
+                    skipped_records += 1;
+                }
                 let lines = data[start..pos].iter().map(|l| (*l).to_string()).collect();
                 events.push((
                     epochs.len(),
@@ -200,6 +213,7 @@ pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, 
         events,
         observations,
         satellite_epochs,
+        skipped_records,
     })
 }
 
@@ -569,6 +583,8 @@ mod tests {
         let f = parse(TABLE_A4.as_bytes(), None).unwrap();
         assert_eq!(f.header.get_line("MARKER NAME"), Some("A 9080".to_string()));
         assert!(f.header.ends_with("END OF HEADER\n"));
+        // The 13:14:48 epoch lists two of its three satellites.
+        assert_eq!(f.skipped_records, 1);
 
         // Flag 0 only; flag-1 and flag-6 records become events.
         assert_eq!(f.epochs.len(), 5);
@@ -734,6 +750,60 @@ mod tests {
         let text = TABLE_A4.replacen("A 9080", &format!("{comment}A 9080"), 1);
         let f = parse(text.as_bytes(), None).unwrap();
         assert_eq!(f.epochs.len(), 5);
+    }
+
+    #[test]
+    fn stray_and_rejected_records_are_counted() {
+        let h = |content: &str, label: &str| format!("{content:<60}{label}\n");
+        let mut text = h(
+            "     3.04           OBSERVATION DATA    M",
+            "RINEX VERSION / TYPE",
+        );
+        text += &h("G    1 C1C", "SYS / # / OBS TYPES");
+        text += &h("", "END OF HEADER");
+        text += "not a record\n";
+        text += "> 2024 10 01 00 00  0.0000000  0  2\n";
+        text += "G01  20000000.000\n";
+        text += "g02  20000001.000\n"; // lower-case system: rejected
+        let f = parse(text.as_bytes(), None).unwrap();
+        assert_eq!(f.epochs.len(), 1);
+        assert_eq!(f.observations.len(), 1);
+        assert_eq!(f.skipped_records, 2);
+    }
+
+    #[test]
+    fn truncated_epochs_and_events_are_counted() {
+        let h = |content: &str, label: &str| format!("{content:<60}{label}\n");
+        let mut head = h(
+            "     3.04           OBSERVATION DATA    M",
+            "RINEX VERSION / TYPE",
+        );
+        head += &h("G    1 C1C", "SYS / # / OBS TYPES");
+        head += &h("", "END OF HEADER");
+        let short = "> 2024 10 01 00 00  0.0000000  0  2\nG01  20000000.000\n";
+        let next = "> 2024 10 01 00 00  1.0000000  0  1\nG01  20000001.000\n";
+        // An epoch missing a satellite record, at the end of the file and
+        // before the next epoch.
+        for (text, epochs) in [
+            (format!("{head}{short}"), 1),
+            (format!("{head}{short}{next}"), 2),
+        ] {
+            let f = parse(text.as_bytes(), None).unwrap();
+            assert_eq!(f.epochs.len(), epochs);
+            assert_eq!(f.skipped_records, 1, "{text}");
+        }
+        // Events missing records: a cycle slip before the next epoch and a
+        // comment event at the end of the file.
+        let slip = "> 2024 10 01 00 00  0.0000000  6  2\nG01  20000000.000\n";
+        let comment = "> 2024 10 01 00 00  1.0000000  4  2\nA COMMENT\n";
+        for text in [
+            format!("{head}{slip}{next}"),
+            format!("{head}{next}{comment}"),
+        ] {
+            let f = parse(text.as_bytes(), None).unwrap();
+            assert_eq!(f.events.len(), 1);
+            assert_eq!(f.skipped_records, 1, "{text}");
+        }
     }
 
     // ---- fixture tests -----------------------------------------------

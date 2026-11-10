@@ -416,6 +416,7 @@ mod tests {
             observations: value.map(|v| (key, obs(v))).into_iter().collect(),
             // Listed even without a value: every field blank.
             satellite_epochs: [(key.0, vec![0])].into_iter().collect(),
+            skipped_records: 0,
         }
     }
 

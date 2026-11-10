@@ -208,6 +208,7 @@ fn version_is_the_rinex_version_in_every_format() {
         events: Vec::new(),
         observations: BTreeMap::new(),
         satellite_epochs: BTreeMap::new(),
+        skipped_records: 0,
     };
     assert_eq!(unversioned.version(), None);
 }

@@ -110,6 +110,15 @@ pub struct ObsFile {
     /// `observations` does not.  With a filter, only satellites with at
     /// least one selected signal are listed.
     pub satellite_epochs: BTreeMap<SatId, Vec<usize>>,
+    /// Data records the reader skipped because it could not parse or use
+    /// them: a corrupted epoch header, a satellite record it rejected, an
+    /// epoch or event cut short by the end of the file or the next epoch
+    /// (counted once), or, in RINEX, a non-blank line that was none of these.  The RINEX text readers
+    /// resynchronize at the next epoch instead of failing, so this is the
+    /// only signal that part of the file was lost.  Blank lines and other
+    /// tolerated padding are not counted.  Always zero for SRNX, which
+    /// reports a malformed chunk as an error.
+    pub skipped_records: usize,
 }
 
 /// Builds [`ObsFile::observations`] and [`ObsFile::satellite_epochs`] for

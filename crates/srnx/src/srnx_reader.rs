@@ -180,6 +180,8 @@ pub fn read(bytes: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, S
         events,
         observations,
         satellite_epochs,
+        // Malformed chunks are errors here, so nothing is skipped.
+        skipped_records: 0,
     })
 }
 

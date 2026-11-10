@@ -35,9 +35,12 @@ This returns an `srnx::model::ObsFile`, which contains:
   into the observation epochs;
 - a map of (satellite, observation code) -> observation lists, with
   each observation list containing tuples of epoch index and observations;
-  and
 - a map of satellite -> the epochs that list it, including epochs where
-  all of its observations are blank.
+  all of its observations are blank; and
+- the number of malformed records the reader skipped.  The RINEX and
+  Compact RINEX readers resynchronize at the next epoch instead of
+  failing, so a non-zero count is the only signal that part of the file
+  was lost.
 
 The map does not preserve the original order of satellites within an epoch.
 Observation values are returned as i64 integers counting milli-units,

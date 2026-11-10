@@ -56,8 +56,6 @@ pub enum Rinex2Error {
     EpochLineTooShort(usize),
     #[error("invalid epoch flag or satellite count on line {0}")]
     BadEpochHeader(usize),
-    #[error("file ended mid-epoch (expected {expected} observation lines, got {got})")]
-    UnexpectedEof { expected: usize, got: usize },
     #[error("observation file has no obs codes in header")]
     NoObsCodes,
 }
@@ -77,7 +75,9 @@ pub fn catalog(input: &[u8]) -> Result<Catalog, Rinex2Error> {
 /// Parse a complete RINEX v2 observation file, keeping only the
 /// satellite/signal pairs that `filter` selects (all of them for `None`).
 ///
-/// Both LF and CRLF line endings are accepted.
+/// Both LF and CRLF line endings are accepted.  Malformed epochs and stray
+/// lines are skipped and counted in [`ObsFile::skipped_records`]; the next
+/// plausible epoch header resumes parsing.
 #[allow(clippy::too_many_lines)]
 pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, Rinex2Error> {
     let text = std::str::from_utf8(input).map_err(|_| Rinex2Error::NotUtf8)?;
@@ -124,6 +124,7 @@ pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, 
     let mut series = SeriesBuilder::default();
     let mut epochs: Vec<EpochRecord> = Vec::new();
     let mut events: Vec<(usize, EventRecord)> = Vec::new();
+    let mut skipped_records = 0_usize;
 
     let mut pos = 0; // index into data_lines
     while pos < data_lines.len() {
@@ -133,6 +134,9 @@ pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, 
         // Parse the epoch / satellite header line.
         let Ok((epoch_rec, flag, num_entries)) = parse_epoch_header(line, line_no) else {
             // Not a valid epoch header — skip to the next plausible one.
+            if !line.trim().is_empty() {
+                skipped_records += 1;
+            }
             pos += 1;
             continue;
         };
@@ -146,6 +150,10 @@ pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, 
         if (2u8..=5).contains(&flag) {
             let epoch_idx = epochs.len();
             let end = (pos + num_entries).min(data_lines.len());
+            if end - pos < num_entries {
+                // Truncated by the end of the file.
+                skipped_records += 1;
+            }
             let event_lines: Vec<String> = data_lines[pos..end]
                 .iter()
                 .map(|l| (*l).to_string())
@@ -258,6 +266,7 @@ pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, 
         }
 
         if malformed {
+            skipped_records += 1;
             // Already found an epoch header mid-block? Jump there.
             if let Some(target) = skip_to {
                 pos = target;
@@ -343,6 +352,7 @@ pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, 
         events,
         observations,
         satellite_epochs,
+        skipped_records,
     })
 }
 
@@ -1080,6 +1090,11 @@ mod tests {
         let obs = "  20000030.000\n  20000031.000\n";
         let good = three_epochs(&format!("EPOCH  2G01G02\n{obs}"));
         assert_eq!(parse(good.as_bytes(), None).unwrap().epochs.len(), 3);
+        assert_eq!(
+            parse(good.as_bytes(), None).unwrap().skipped_records,
+            0,
+            "a well-formed file skips nothing"
+        );
 
         for middle in [
             "EPOCH  2G01e02\n", // lower-case system letter
@@ -1093,6 +1108,7 @@ mod tests {
             let f = parse(text.as_bytes(), None).unwrap();
             let secs: Vec<u64> = f.epochs.iter().map(|e| e.seconds_e7).collect();
             assert_eq!(secs, [0, 600_000_000], "{middle:?}");
+            assert!(f.skipped_records > 0, "{middle:?}");
             let c1 = &f.observations[&(
                 SatId::new(SatSystem::GPS, 1),
                 ObsCode::from_v2("C1").unwrap(),
@@ -1104,6 +1120,23 @@ mod tests {
                 "{middle:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_truncated_event_is_counted() {
+        let h = |content: &str, label: &str| format!("{content:<60}{label}\n");
+        let text = h(
+            "     2.11           OBSERVATION DATA    G (GPS)",
+            "RINEX VERSION / TYPE",
+        ) + &h("     1    C1", "# / TYPES OF OBSERV")
+            + &h("", "END OF HEADER")
+            + " 24 10  1  0  0  0.0000000  0  1G01\n  20000000.000\n"
+            + " 24 10  1  0  0  1.0000000  4  2\n"
+            + &h("ONLY ONE OF TWO", "COMMENT");
+        let f = parse(text.as_bytes(), None).unwrap();
+        assert_eq!(f.epochs.len(), 1);
+        assert_eq!(f.events.len(), 1);
+        assert_eq!(f.skipped_records, 1);
     }
 
     #[test]
@@ -1215,6 +1248,9 @@ mod tests {
     fn fixture_observation_series_sorted() {
         for stem in ["at01_v211_1hz", "n302_v211_30s", "mty2_v211_15s"] {
             let obs = fixture(stem);
+            // The fixtures carry blank lines between epochs, which the
+            // reader skips without counting them.
+            assert_eq!(obs.skipped_records, 0, "{stem}");
             // Every observation series must have epoch indices in ascending
             // order, within the valid range, and contain at least one entry.
             let num_epochs = obs.epochs.len();
