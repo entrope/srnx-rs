@@ -70,8 +70,10 @@ pub enum SocdError {
     ReservedBlockHeader(u8),
     #[error("SOCD observation count {0} exceeds addressable memory")]
     TooManyObservations(u64),
-    #[error("SOCD schema delta order {0} exceeds maximum of 7")]
-    InvalidDeltaOrder(u8),
+    #[error("SOCD encoding schema {0} is reserved")]
+    ReservedSchema(u64),
+    #[error("SOCD explicit scale {0} is out of range")]
+    BadScale(u64),
 }
 
 /// Decoded content of one `SOCD` chunk.
@@ -150,21 +152,23 @@ pub fn parse(payload: &[u8]) -> Result<Socd, SocdError> {
     }
     let mut obs = &cursor[..obs_byte_len];
 
+    // The schema byte is the delta order plus 8 when an explicit scale is
+    // present; higher values are reserved, as in SOC2.
     let schema = read_uleb128(&mut obs)?;
-    let delta_order = (schema & 7) as u8;
-    if delta_order > 7 {
-        return Err(SocdError::InvalidDeltaOrder(delta_order));
+    if schema > 15 {
+        return Err(SocdError::ReservedSchema(schema));
     }
-    let has_explicit_scale = schema >= 8;
+    let delta_order = u8::try_from(schema & 7).expect("masked to three bits");
+    let has_explicit_scale = schema & 8 != 0;
 
     let scale = if has_explicit_scale {
-        let s_u64 = read_uleb128(&mut obs)?;
-        let s = u32::try_from(s_u64).unwrap_or(1_000_000_000);
-        if s == 0 {
-            1
-        } else {
-            s
+        // The scale is the value's least significant bit in milli-units, at
+        // most 1e6 units (one billion in ULEB128).
+        let s = read_uleb128(&mut obs)?;
+        if s == 0 || s > 1_000_000_000 {
+            return Err(SocdError::BadScale(s));
         }
+        u32::try_from(s).expect("scale is at most one billion")
     } else {
         1 // default per spec: "If no explicit scale is used, it is the same as 1"
     };
@@ -720,6 +724,36 @@ mod tests {
 
         let socd = parse(&out).unwrap();
         assert_eq!(socd.lli, b"  1 ");
+    }
+
+    #[test]
+    fn reserved_schema_and_bad_scale_are_rejected() {
+        // One observation, no LLI or SSI runs, then the schema and `extra`.
+        let with_schema = |schema: u64, extra: &[u8]| {
+            let mut out = b"G01\0L1\0\0".to_vec();
+            out.extend(enc_uleb(0));
+            out.extend(enc_uleb(0));
+            out.extend(enc_uleb(0));
+            let mut obs = Vec::new();
+            obs.extend(enc_uleb(schema));
+            obs.extend_from_slice(extra);
+            out.extend(enc_uleb(obs.len() as u64));
+            out.extend(obs);
+            out
+        };
+        assert!(matches!(
+            parse(&with_schema(16, &[])),
+            Err(SocdError::ReservedSchema(16))
+        ));
+        let scale = enc_uleb;
+        assert!(matches!(
+            parse(&with_schema(8, &scale(0))),
+            Err(SocdError::BadScale(0))
+        ));
+        assert!(matches!(
+            parse(&with_schema(8, &scale(1_000_000_001))),
+            Err(SocdError::BadScale(1_000_000_001))
+        ));
     }
 
     #[test]
