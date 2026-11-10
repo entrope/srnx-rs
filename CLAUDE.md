@@ -115,7 +115,7 @@ These are easy to miss on a first read of `docs/Succinct_RINEX.md`:
   8–15 = explicit scale present. Default scale (no explicit) is 1000×.
 - Bit-matrix blocks store values **bitwise-transposed**, MSB-first, sign-
   extended from the top bit. The matrix is `(k+1)` rows of `m/8` bytes each,
-  where `m ∈ {8, 16, 32, 64, 128}`.
+  where `m ∈ {8, 16, 24, 32, 40, 48, 112}`.
 - Block tag `0xFD` = run of absent values (`INT64_MIN` sentinel), `0xFE` =
   run of zeros, `0xFF` = run of SLEB128 values. Absent values do **not**
   advance the delta accumulator.
