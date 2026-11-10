@@ -76,6 +76,8 @@ pub enum CrinexError {
     Truncated(usize),
     #[error("line {0}: malformed epoch line")]
     BadEpochLine(usize),
+    #[error("line {0}: malformed observation-type count")]
+    BadTypeCount(usize),
     #[error("line {0}: arc should be initialized, but is not")]
     NotInitialized(usize),
     #[error("line {line}: satellite system {system:?} has no observation types in the header")]
@@ -211,7 +213,7 @@ pub fn decompress(input: &[u8]) -> Result<Vec<u8>, CrinexError> {
     loop {
         let line = lines.next().ok_or(CrinexError::NoEndOfHeader)?;
         push_line(&mut out, line);
-        obs_types.update(line);
+        obs_types.update(line, lines.line_no)?;
         if label(line).starts_with(LABEL_END_OF_HEADER) {
             break;
         }
@@ -294,23 +296,49 @@ impl ObsTypeCounts {
         }
     }
 
-    fn update(&mut self, line: &[u8]) {
+    fn update(&mut self, line: &[u8], line_no: usize) -> Result<(), CrinexError> {
         let label = label(line);
-        if label.starts_with(LABEL_V2_OBS_TYPES) && line.get(5).is_some_and(|&b| b != b' ') {
-            self.v2 = count_field(line, 0, 6);
+        // A v2 continuation line leaves the whole count field blank; any
+        // other character there must be part of a valid count.
+        let v2_count = line.get(..6).unwrap_or(line);
+        if label.starts_with(LABEL_V2_OBS_TYPES) && v2_count.iter().any(|&b| b != b' ') {
+            self.v2 = count_field(line, 0, 6, line_no)?;
         } else if label.starts_with(LABEL_V3_OBS_TYPES) {
             if let Some(&sys) = line.first().filter(|&&b| b != b' ') {
-                self.by_system[usize::from(sys)] = Some(count_field(line, 3, 3));
+                self.by_system[usize::from(sys)] = Some(count_field(line, 3, 3, line_no)?);
             }
         }
+        Ok(())
     }
 }
 
-/// The unsigned count in `line[start..start + width]`: leading blanks, then
-/// digits.  Reading only the count's columns keeps a long digit run in the
-/// rest of the line from inflating it.
-fn count_field(line: &[u8], start: usize, width: usize) -> usize {
-    atoi(line.get(start..start + width).unwrap_or(&[]))
+/// The unsigned count in `line[start..start + width]`: blanks, digits, then
+/// blanks.  Reading only the count's columns keeps a long digit run in the
+/// rest of the line from inflating it, and any other character is a
+/// malformed record rather than a silently shorter count.
+fn count_field(
+    line: &[u8],
+    start: usize,
+    width: usize,
+    line_no: usize,
+) -> Result<usize, CrinexError> {
+    let field = line.get(start..start + width).unwrap_or(&[]);
+    let mut at = field
+        .iter()
+        .position(|&b| b != b' ')
+        .ok_or(CrinexError::BadTypeCount(line_no))?;
+    let mut count = 0_usize;
+    while let Some(digit) = field.get(at).and_then(|&b| b.checked_sub(b'0')) {
+        if digit > 9 {
+            break;
+        }
+        count = count.saturating_mul(10).saturating_add(usize::from(digit));
+        at += 1;
+    }
+    if field[at..].iter().any(|&b| b != b' ') {
+        return Err(CrinexError::BadTypeCount(line_no));
+    }
+    Ok(count)
 }
 
 /// C `atoi` on an unsigned count: leading blanks, then digits up to the
@@ -566,7 +594,7 @@ impl<'a> Decoder<'a> {
             for _ in 0..count {
                 let record = self.lines.require()?;
                 push_line(&mut self.out, record);
-                self.obs_types.update(record);
+                self.obs_types.update(record, self.lines.line_no)?;
             }
         }
         Ok(())
@@ -1092,7 +1120,7 @@ E11  25180322.500 5
             "{:<60}SYS / # / OBS TYPES",
             "G  99999999999999999999999 C1C"
         );
-        counts.update(line.as_bytes());
+        counts.update(line.as_bytes(), 1).unwrap();
         assert_eq!(counts.by_system[usize::from(b'G')], Some(999));
 
         // The same header still decodes; the data line supplies one field.
@@ -1108,6 +1136,43 @@ G  99999999999999999999999 C1C                              SYS / # / OBS TYPES
         let line = rnx.lines().last().unwrap();
         assert!(line.starts_with("G01"), "{line:?}");
         assert_eq!(line.matches(".001").count(), 1, "{line:?}");
+    }
+
+    #[test]
+    fn a_malformed_type_count_is_rejected() {
+        let mut counts = ObsTypeCounts::new();
+        // A non-digit after the digits of a v3 count field.
+        let line = format!("{:<60}SYS / # / OBS TYPES", "G  1x2 C1C");
+        assert!(matches!(
+            counts.update(line.as_bytes(), 3),
+            Err(CrinexError::BadTypeCount(3))
+        ));
+        // The same for a v2 count field, including one whose last column
+        // is blank: only an all-blank field marks a continuation line.
+        for field in ["1    x", "1x2   ", "    x "] {
+            let line = format!("{:<60}# / TYPES OF OBSERV", format!("{field}    C1"));
+            assert!(
+                matches!(
+                    counts.update(line.as_bytes(), 4),
+                    Err(CrinexError::BadTypeCount(4))
+                ),
+                "{field:?}"
+            );
+        }
+
+        // Decompression reports it rather than reading the line as a
+        // continuation and losing its code.
+        let crx = "\
+1.0                 COMPACT RINEX FORMAT                    CRINEX VERS   / TYPE
+RNX2CRX ver.4.2.0                       14-Oct-26 00:52     CRINEX PROG / DATE
+     2.11           OBSERVATION DATA    G (GPS)             RINEX VERSION / TYPE
+1x2       C1                                                # / TYPES OF OBSERV
+                                                            END OF HEADER
+";
+        assert!(matches!(
+            decompress(crx.as_bytes()),
+            Err(CrinexError::BadTypeCount(4))
+        ));
     }
 
     #[test]
