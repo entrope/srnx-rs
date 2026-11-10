@@ -50,13 +50,13 @@ pub struct HeaderText {
 }
 
 impl HeaderText {
-    /// Create from raw bytes. Normalizes CRLF/CR to LF.
+    /// Create from raw bytes.  Normalizes CRLF/CR to LF, and maps any byte
+    /// that is not valid UTF-8 to `?`, one per byte, so columns stay put.
     #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Self {
-        let text = String::from_utf8_lossy(bytes)
-            .replace("\r\n", "\n")
-            .replace('\r', "\n");
-        Self { text }
+        Self {
+            text: to_text(bytes).replace("\r\n", "\n").replace('\r', "\n"),
+        }
     }
 
     /// Create from a `&str`. Normalizes CRLF/CR to LF.
@@ -131,8 +131,6 @@ impl std::ops::Deref for HeaderText {
 #[derive(Debug, Error, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum HeaderError {
-    #[error("RINEX header is not valid UTF-8")]
-    NotUtf8,
     #[error("missing END OF HEADER")]
     NoEndOfHeader,
     #[error("missing RINEX VERSION / TYPE line")]
@@ -395,7 +393,29 @@ pub fn sniff_version(bytes: &[u8]) -> Option<Version> {
 
 #[doc(hidden)]
 pub fn parse(bytes: &[u8]) -> Result<Header, HeaderError> {
-    parse_str(std::str::from_utf8(bytes).map_err(|_| HeaderError::NotUtf8)?)
+    parse_str(&to_text(bytes))
+}
+
+/// `bytes` as text for fixed-column parsing.  A file with any invalid UTF-8
+/// byte is mapped to one `?` per byte, so its columns (and therefore its
+/// header labels) stay where the file put them; a file that is valid UTF-8,
+/// the usual case, is borrowed.
+pub(crate) fn to_text(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => std::borrow::Cow::Borrowed(text),
+        Err(_) => std::borrow::Cow::Owned(
+            bytes
+                .iter()
+                .map(|&b| {
+                    if b < 0x80 {
+                        char::from(b)
+                    } else {
+                        '?'
+                    }
+                })
+                .collect(),
+        ),
+    }
 }
 
 /// [`parse`] for text already known to be UTF-8.

@@ -50,8 +50,6 @@ use crate::rinex_header::{self, Header, HeaderError, HeaderText, ObsCode, SatSys
 pub enum Rinex2Error {
     #[error("header parse error: {0}")]
     Header(#[from] HeaderError),
-    #[error("input is not valid UTF-8")]
-    NotUtf8,
     #[error("no END OF HEADER line found")]
     NoEndOfHeader,
     #[error("epoch line is too short to contain a timestamp (line {0})")]
@@ -82,10 +80,10 @@ pub fn catalog(input: &[u8]) -> Result<Catalog, Rinex2Error> {
 /// plausible epoch header resumes parsing.
 #[allow(clippy::too_many_lines)]
 pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, Rinex2Error> {
-    let text = std::str::from_utf8(input).map_err(|_| Rinex2Error::NotUtf8)?;
+    let text = rinex_header::to_text(input);
 
     // Split into lines (strips the newline character(s)).
-    let lines = split_lines(text);
+    let lines = split_lines(&text);
 
     // Locate the END OF HEADER line.
     let eoh_idx = lines
@@ -107,7 +105,7 @@ pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, 
 
     // Parse the header section (pass the whole text — the header parser
     // tolerates trailing data because it stops at END OF HEADER).
-    let header = rinex_header::parse_str(text).map_err(Rinex2Error::Header)?;
+    let header = rinex_header::parse_str(&text).map_err(Rinex2Error::Header)?;
 
     // An event's `# / TYPES OF OBSERV` records change these.
     let mut obs_codes = obs_codes(&header)?.to_vec();
@@ -1151,6 +1149,33 @@ mod tests {
         assert_eq!(f.epochs.len(), 1);
         assert_eq!(f.events.len(), 1);
         assert_eq!(f.skipped_records, 1);
+    }
+
+    #[test]
+    fn non_utf8_header_text_is_read_lossily() {
+        // A Latin-1 marker name (0xFC is "ü" in Latin-1) must not reject the
+        // file, and must not move the label in the columns that follow it.
+        let line = |content: &[u8], label: &str| {
+            let mut line = content.to_vec();
+            line.resize(60, b' ');
+            line.extend_from_slice(label.as_bytes());
+            line.push(b'\n');
+            line
+        };
+        let mut text = line(
+            b"     2.11           OBSERVATION DATA    G (GPS)",
+            "RINEX VERSION / TYPE",
+        );
+        text.extend(line(b"Z\xfcrich", "MARKER NAME"));
+        text.extend(line(b"     1    C1", "# / TYPES OF OBSERV"));
+        text.extend(line(b"", "END OF HEADER"));
+        text.extend(b" 24 10  1  0  0  0.0000000  0  1G01\n  20000000.000\n");
+        let f = parse(&text, None).unwrap();
+        assert_eq!(f.epochs.len(), 1);
+        assert_eq!(
+            f.header.get_line("MARKER NAME"),
+            Some("Z?rich".to_string())
+        );
     }
 
     #[test]

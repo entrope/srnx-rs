@@ -56,8 +56,6 @@ use crate::rinex_header::{self, Header, HeaderError, HeaderText, ObsCode, SatSys
 pub enum Rinex3Error {
     #[error("header parse error: {0}")]
     Header(#[from] HeaderError),
-    #[error("input is not valid UTF-8")]
-    NotUtf8,
     #[error("no END OF HEADER line found")]
     NoEndOfHeader,
     #[error("RINEX version {major}.{minor:02} is not 3.xx or 4.xx")]
@@ -89,8 +87,8 @@ pub fn catalog(input: &[u8]) -> Result<Catalog, Rinex3Error> {
 /// the next line starting with `>`.
 #[allow(clippy::too_many_lines)]
 pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, Rinex3Error> {
-    let text = std::str::from_utf8(input).map_err(|_| Rinex3Error::NotUtf8)?;
-    let lines = split_lines(text);
+    let text = rinex_header::to_text(input);
+    let lines = split_lines(&text);
 
     let eoh_idx = lines
         .iter()
@@ -104,7 +102,7 @@ pub fn parse(input: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, 
     let mut raw_header_text = lines[..=eoh_idx].join("\n");
     raw_header_text.push('\n');
 
-    let header = rinex_header::parse_str(text)?;
+    let header = rinex_header::parse_str(&text)?;
     // An event's `SYS / # / OBS TYPES` records change these.
     let mut codes_by_sys: Vec<Vec<ObsCode>> = codes_by_system(&header)?
         .iter()
@@ -756,6 +754,29 @@ mod tests {
         let text = TABLE_A4.replacen("A 9080", &format!("{comment}A 9080"), 1);
         let f = parse(text.as_bytes(), None).unwrap();
         assert_eq!(f.epochs.len(), 5);
+    }
+
+    #[test]
+    fn non_utf8_header_text_is_read_lossily() {
+        // Latin-1 in a comment must not reject the file or move the labels.
+        let line = |content: &[u8], label: &str| {
+            let mut line = content.to_vec();
+            line.resize(60, b' ');
+            line.extend_from_slice(label.as_bytes());
+            line.push(b'\n');
+            line
+        };
+        let mut text = line(
+            b"     3.04           OBSERVATION DATA    M",
+            "RINEX VERSION / TYPE",
+        );
+        text.extend(line(b"caf\xe9", "COMMENT"));
+        text.extend(line(b"G    1 C1C", "SYS / # / OBS TYPES"));
+        text.extend(line(b"", "END OF HEADER"));
+        text.extend(b"> 2024 10 01 00 00  0.0000000  0  1\nG01  20000000.000\n");
+        let f = parse(&text, None).unwrap();
+        assert_eq!(f.epochs.len(), 1);
+        assert_eq!(f.header.get_line("COMMENT"), Some("caf?".to_string()));
     }
 
     #[test]
