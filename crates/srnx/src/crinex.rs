@@ -297,13 +297,20 @@ impl ObsTypeCounts {
     fn update(&mut self, line: &[u8]) {
         let label = label(line);
         if label.starts_with(LABEL_V2_OBS_TYPES) && line.get(5).is_some_and(|&b| b != b' ') {
-            self.v2 = atoi(line);
+            self.v2 = count_field(line, 0, 6);
         } else if label.starts_with(LABEL_V3_OBS_TYPES) {
             if let Some(&sys) = line.first().filter(|&&b| b != b' ') {
-                self.by_system[usize::from(sys)] = Some(atoi(line.get(3..).unwrap_or_default()));
+                self.by_system[usize::from(sys)] = Some(count_field(line, 3, 3));
             }
         }
     }
+}
+
+/// The unsigned count in `line[start..start + width]`: leading blanks, then
+/// digits.  Reading only the count's columns keeps a long digit run in the
+/// rest of the line from inflating it.
+fn count_field(line: &[u8], start: usize, width: usize) -> usize {
+    atoi(line.get(start..start + width).unwrap_or(&[]))
 }
 
 /// C `atoi` on an unsigned count: leading blanks, then digits up to the
@@ -1074,6 +1081,33 @@ E11  25180322.100
 E11  25180322.500 5
 ";
         assert_eq!(body, want);
+    }
+
+    #[test]
+    fn a_huge_count_field_is_bounded_by_its_columns() {
+        // The count field is three columns; digits after it must not inflate
+        // it to an absurd value (which would be a huge allocation).
+        let mut counts = ObsTypeCounts::new();
+        let line = format!(
+            "{:<60}SYS / # / OBS TYPES",
+            "G  99999999999999999999999 C1C"
+        );
+        counts.update(line.as_bytes());
+        assert_eq!(counts.by_system[usize::from(b'G')], Some(999));
+
+        // The same header still decodes; the data line supplies one field.
+        let header = "\
+3.1                 COMPACT RINEX FORMAT                    CRINEX VERS   / TYPE
+RNX2CRX ver.4.2.0                       14-Oct-26 00:52     CRINEX PROG / DATE
+     4.02           OBSERVATION DATA    M                   RINEX VERSION / TYPE
+G  99999999999999999999999 C1C                              SYS / # / OBS TYPES
+                                                            END OF HEADER
+";
+        let crx = format!("{header}> 2024 10 01 00 00  0.0000000  0  1      G01\n\n3&1\n");
+        let rnx = String::from_utf8(decompress(crx.as_bytes()).unwrap()).unwrap();
+        let line = rnx.lines().last().unwrap();
+        assert!(line.starts_with("G01"), "{line:?}");
+        assert_eq!(line.matches(".001").count(), 1, "{line:?}");
     }
 
     #[test]

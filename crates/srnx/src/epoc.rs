@@ -140,7 +140,12 @@ pub fn parse(payload: &[u8], kind: EpochChunkKind) -> Result<Epoc, EpocError> {
         });
     }
 
-    let mut epochs: Vec<Epoch> = Vec::with_capacity(total_usize);
+    // A crafted chunk can declare any count in a few bytes, so an impossible
+    // reservation must be an error rather than a panic or an abort.
+    let mut epochs: Vec<Epoch> = Vec::new();
+    epochs
+        .try_reserve_exact(total_usize)
+        .map_err(|_| EpocError::TooManyEpochs(total))?;
     while u64::try_from(epochs.len()).expect("len fits in u64") < total {
         let interval = read_sleb128(&mut cursor)?;
         let span_count_m1 = read_uleb128(&mut cursor)?;
@@ -544,6 +549,16 @@ mod tests {
         let p = build_payload(1, &[(-1, 0, 20 * 10_000 + 7 * 100 + 18, 0)], &[]);
         let e = parse(&p, EpochChunkKind::Epoc).unwrap();
         assert_eq!(e.epochs[0].year, 2020);
+    }
+
+    #[test]
+    fn oversized_epoch_count_is_an_error() {
+        // Ten bytes may declare any count; it must not be reserved.
+        let p = enc_uleb(u64::MAX - 1);
+        assert!(matches!(
+            parse(&p, EpochChunkKind::Epoc),
+            Err(EpocError::TooManyEpochs(_))
+        ));
     }
 
     #[test]

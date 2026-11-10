@@ -62,6 +62,8 @@ pub enum FileError {
     Socd(#[from] SocdError),
     #[error("SOC2 chunk error: {0}")]
     Soc2(#[from] Soc2Error),
+    #[error("observation chunk declares {declared} observations, but the satellite has {present} epochs")]
+    ObservationCount { declared: u64, present: usize },
     #[error("EVTF chunk at file offset {offset}: {source}")]
     Evtf { offset: u64, source: EvtfError },
     #[error("SDIR gives EVTF offset {sdir}, but the first EVTF chunk is at {first}")]

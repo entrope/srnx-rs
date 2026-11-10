@@ -127,6 +127,14 @@ pub fn parse(payload: &[u8]) -> Result<Socd, SocdError> {
     let count =
         usize::try_from(count_u64).map_err(|_| SocdError::TooManyObservations(count_u64))?;
 
+    // Every observation needs an entry in each vector, so reserve them up
+    // front.  A crafted chunk can declare any count in a few bytes, and an
+    // impossible reservation must be an error rather than a panic.
+    let mut values: Vec<i64> = Vec::new();
+    values
+        .try_reserve_exact(count)
+        .map_err(|_| SocdError::TooManyObservations(count_u64))?;
+
     // LLI run-length block.
     let lli = decode_rle_block(&mut cursor, count)?;
 
@@ -171,7 +179,6 @@ pub fn parse(payload: &[u8]) -> Result<Socd, SocdError> {
     };
 
     // Decode blocks.
-    let mut values: Vec<i64> = Vec::with_capacity(count);
     let mut block_header_counts: BTreeMap<u8, usize> = BTreeMap::new();
     while !obs.is_empty() {
         let header = obs[0];
@@ -185,6 +192,7 @@ pub fn parse(payload: &[u8]) -> Result<Socd, SocdError> {
                 let m_table: [usize; 7] = [8, 16, 24, 32, 40, 48, 112];
                 let m_index = (header >> 5) as usize;
                 let m = m_table[m_index];
+                check_block(m, count, values.len())?;
                 let k = (header & 0x1F) as usize;
                 let bits_per_value = k + 1; // 1..=32
                 let row_bytes = m / 8;
@@ -206,11 +214,13 @@ pub fn parse(payload: &[u8]) -> Result<Socd, SocdError> {
             0xFD => {
                 // Absent-values run — do NOT advance the integrator.
                 let run = uleb_run_count(&mut obs)?;
+                check_block(run, count, values.len())?;
                 values.extend(std::iter::repeat(ABSENT).take(run));
             }
             0xFE => {
                 // Zero-delta run — feed zero deltas through the integrator.
                 let run = uleb_run_count(&mut obs)?;
+                check_block(run, count, values.len())?;
                 for _ in 0..run {
                     values.push(integrator.integrate(0));
                 }
@@ -218,6 +228,7 @@ pub fn parse(payload: &[u8]) -> Result<Socd, SocdError> {
             0xFF => {
                 // SLEB128-delta run.
                 let run = uleb_run_count(&mut obs)?;
+                check_block(run, count, values.len())?;
                 for _ in 0..run {
                     let delta = read_sleb128(&mut obs)?;
                     values.push(integrator.integrate(delta));
@@ -249,6 +260,32 @@ pub fn parse(payload: &[u8]) -> Result<Socd, SocdError> {
 
 // ── RLE / run-count helpers ──────────────────────────────────────────────────
 
+/// The observation count a `SOCD` or `SOC2` payload declares, from the
+/// count-minus-1 ULEB128 that follows the 8-byte observation name.  The two
+/// chunk types share this prefix.
+pub fn declared_count(payload: &[u8]) -> Result<u64, SocdError> {
+    let (_, rest) =
+        split_first_chunk::<8>(payload).ok_or(SocdError::Truncated { what: "obs name" })?;
+    let mut cursor = rest;
+    read_uleb128(&mut cursor)?
+        .checked_add(1)
+        .ok_or(SocdError::Leb(LebError::Overflow))
+}
+
+/// Check that a block of `len` values fits in the `count` the chunk
+/// declares.  Blocks and runs carry file-supplied lengths, so without this
+/// a crafted chunk could decode past its declared size without bound.
+#[inline]
+fn check_block(len: usize, count: usize, decoded: usize) -> Result<(), SocdError> {
+    if len > count - decoded {
+        return Err(SocdError::CountMismatch {
+            declared: count,
+            decoded: decoded.saturating_add(len),
+        });
+    }
+    Ok(())
+}
+
 /// Read a ULEB128 count-minus-1 and return the actual count (`count_m1 + 1`),
 /// converting to `usize` safely.
 #[inline]
@@ -275,7 +312,9 @@ fn decode_rle_block(cursor: &mut &[u8], count: usize) -> Result<Vec<u8>, SocdErr
     let mut rle = &cursor[..byte_len];
     *cursor = &cursor[byte_len..];
 
-    let mut out = Vec::with_capacity(count);
+    let mut out = Vec::new();
+    out.try_reserve_exact(count)
+        .map_err(|_| SocdError::TooManyObservations(count as u64))?;
     while !rle.is_empty() && out.len() < count {
         let packed = read_uleb128(&mut rle)?;
         let idx = (packed % 11) as usize;
@@ -683,7 +722,46 @@ mod tests {
         assert_eq!(socd.lli, b"  1 ");
     }
 
+    #[test]
+    fn oversized_counts_and_runs_are_errors() {
+        // A count of u64::MAX cannot be reserved.
+        let mut p = b"G01\0L1\0\0".to_vec();
+        p.extend(enc_uleb(u64::MAX - 1));
+        assert!(matches!(
+            parse(&p),
+            Err(SocdError::TooManyObservations(_))
+        ));
+
+        // A run longer than the declared count, for every run header.
+        for header in [0xFD, 0xFE, 0xFF] {
+            let mut out = b"G01\0L1\0\0".to_vec();
+            out.extend(enc_uleb(0)); // one observation
+            out.extend(enc_uleb(0)); // no LLI runs
+            out.extend(enc_uleb(0)); // no SSI runs
+            let mut obs = vec![0]; // schema: order 0, no explicit scale
+            obs.push(header);
+            obs.extend(enc_uleb(u64::MAX));
+            out.extend(enc_uleb(obs.len() as u64));
+            out.extend(obs);
+            assert!(
+                matches!(parse(&out), Err(SocdError::CountMismatch { .. })),
+                "{header:#04x}"
+            );
+        }
+
+        // An eight-value bit-matrix block in a one-observation chunk.
+        let mut out = b"G01\0L1\0\0".to_vec();
+        out.extend(enc_uleb(0)); // one observation
+        out.extend(enc_uleb(0)); // no LLI runs
+        out.extend(enc_uleb(0)); // no SSI runs
+        let obs = [0, 0x00, 0x00]; // schema, m=8 with one bit per value
+        out.extend(enc_uleb(obs.len() as u64));
+        out.extend(obs);
+        assert!(matches!(parse(&out), Err(SocdError::CountMismatch { .. })));
+    }
+
     // ── Fixture integration tests ─────────────────────────────────────────
+
 
     /// The payloads of every `SOCD` chunk in an SRNX fixture, in file order.
     fn fixture_socd_chunks(srnx_name: &str) -> Vec<Vec<u8>> {

@@ -14,7 +14,7 @@ use crate::model::{
 use crate::rinex2_obs::byte_at;
 use crate::rinex_header::{self, Header, HeaderError, HeaderText, ObsCode, SatSystem};
 use crate::soc2::{Column, SatelliteColumns};
-use crate::socd::ABSENT;
+use crate::socd::{self, ABSENT};
 
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -127,6 +127,16 @@ pub fn read(bytes: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, S
             let chunk = file.chunk_at_offset(offset).ok_or(FileError::Truncated {
                 what: "observation chunk at advertised offset",
             })?;
+            // A chunk holds one observation per satellite epoch.  Check that
+            // before decoding it: the declared count is file-supplied and
+            // bounds the chunk's allocations.
+            let declared = socd::declared_count(chunk.payload)?;
+            if usize::try_from(declared).ok() != Some(present.len()) {
+                return Err(FileError::ObservationCount {
+                    declared,
+                    present: present.len(),
+                });
+            }
             match &chunk.fourcc {
                 b"SOCD" => Ok(Some(Column::Socd(file.socd_at(offset)?))),
                 b"SOC2" => Ok(Some(Column::Soc2(file.soc2_at(offset)?))),
@@ -148,9 +158,9 @@ pub fn read(bytes: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, S
             let obs_code = obs_codes[code_idx];
 
             let series = observations.entry((sat_id, obs_code)).or_default();
-            let n = present.len().min(socd.values.len());
-            for (i, &ep_idx) in present.iter().enumerate().take(n) {
-                let val = socd.values[i];
+            // `SatelliteColumns` and the declared-count check above both
+            // guarantee one value per satellite epoch.
+            for (i, (&ep_idx, &val)) in present.iter().zip(&socd.values).enumerate() {
                 if val == ABSENT {
                     continue;
                 }
@@ -546,5 +556,103 @@ mod tests {
                 key.1.as_str()
             );
         }
+    }
+
+    /// Append a chunk with no digest.
+    fn push_chunk(out: &mut Vec<u8>, fourcc: [u8; 4], payload: &[u8]) {
+        out.extend_from_slice(&fourcc);
+        crate::leb128::write_uleb128(out, payload.len() as u64);
+        out.extend_from_slice(payload);
+    }
+
+    /// An SRNX file with null digests: a one-code v2 header, one epoch, one
+    /// satellite, and `payload` as its only observation chunk.
+    fn one_epoch_srnx(fourcc: [u8; 4], payload: &[u8]) -> Vec<u8> {
+        let head = 21; // FOURCC + one-byte length + 16-byte padded payload
+        let mut body = Vec::new();
+        let rhdr = format!(
+            "{:<60}{}\n{:<60}{}\n{:<60}{}\n",
+            "     2.11           OBSERVATION DATA    G (GPS)",
+            "RINEX VERSION / TYPE",
+            "     1    L1",
+            "# / TYPES OF OBSERV",
+            "",
+            "END OF HEADER"
+        );
+        push_chunk(&mut body, *b"RHDR", rhdr.as_bytes());
+
+        let epoc_offset = body.len();
+        let mut epoc = Vec::new();
+        crate::leb128::write_uleb128(&mut epoc, 1); // one epoch
+        crate::leb128::write_sleb128(&mut epoc, 0); // interval
+        crate::leb128::write_uleb128(&mut epoc, 0); // epochs in span minus 1
+        crate::leb128::write_uleb128(&mut epoc, 20_241_001); // date
+        crate::leb128::write_uleb128(&mut epoc, 0); // time of day
+        push_chunk(&mut body, *b"EPOC", &epoc);
+
+        // The SATE offset is relative to its own FOURCC, so frame it once
+        // with a placeholder to learn its length.
+        let sate_offset = body.len();
+        let sate = |relative: i64| {
+            let mut p = b"G01\0".to_vec();
+            crate::leb128::write_sleb128(&mut p, relative);
+            crate::leb128::write_uleb128(&mut p, 0); // one presence run
+            crate::leb128::write_uleb128(&mut p, 0); // zero absent epochs
+            crate::leb128::write_uleb128(&mut p, 0); // one present epoch
+            p
+        };
+        let mut framed = Vec::new();
+        push_chunk(&mut framed, *b"SATE", &sate(0));
+        let relative = i64::try_from(framed.len()).unwrap();
+        push_chunk(&mut body, *b"SATE", &sate(relative));
+        push_chunk(&mut body, fourcc, payload);
+
+        let mut sdir = Vec::new();
+        crate::leb128::write_uleb128(&mut sdir, (head + epoc_offset) as u64);
+        crate::leb128::write_uleb128(&mut sdir, 0); // no events
+        sdir.extend_from_slice(b"G01");
+        crate::leb128::write_uleb128(&mut sdir, (head + sate_offset) as u64);
+        let sdir_offset = head + body.len();
+        push_chunk(&mut body, *b"SDIR", &sdir);
+
+        let mut header = vec![1, 0, 0, 0]; // v1.0, null chunk and file digests
+        crate::leb128::write_uleb128(&mut header, sdir_offset as u64);
+        header.resize(16, 0);
+        let mut out = Vec::new();
+        push_chunk(&mut out, *b"SRNX", &header);
+        assert_eq!(out.len(), head);
+        out.extend(body);
+        out
+    }
+
+    #[test]
+    fn observation_count_must_match_the_satellite_epochs() {
+        let key = (SatId::new(SatSystem::GPS, 1), ObsCode::from_v2("L1").unwrap());
+        let payload = |count: u64, value: i64| {
+            let mut p = b"G01\0L1\0\0".to_vec();
+            crate::leb128::write_uleb128(&mut p, count - 1);
+            p.extend([0, 0]); // no LLI or SSI runs
+            let mut obs = vec![0, 0xFF]; // schema 0, SLEB128 run
+            crate::leb128::write_uleb128(&mut obs, count - 1);
+            for _ in 0..count {
+                crate::leb128::write_sleb128(&mut obs, value);
+            }
+            crate::leb128::write_uleb128(&mut p, obs.len() as u64);
+            p.extend(obs);
+            p
+        };
+
+        let file = read(&one_epoch_srnx(*b"SOCD", &payload(1, 7)), None).unwrap();
+        assert_eq!(file.observations[&key], [(0, Obs { value: 7, lli: b' ', ssi: b' ' })]);
+
+        // A chunk may not declare more observations than the satellite has
+        // epochs, and the check must precede decoding the chunk.
+        assert!(matches!(
+            read(&one_epoch_srnx(*b"SOCD", &payload(2, 7)), None),
+            Err(SrnxReadError::File(FileError::ObservationCount {
+                declared: 2,
+                present: 1
+            }))
+        ));
     }
 }

@@ -22,6 +22,8 @@ pub enum Soc2Error {
     Invalid(&'static str),
     #[error("SOC2 arithmetic overflow")]
     Overflow,
+    #[error("SOC2 observation count {0} exceeds addressable memory")]
+    TooManyObservations(u64),
 }
 
 /// Value predictor; reference indices use RHDR/SATE order.
@@ -77,7 +79,11 @@ fn section<'a>(cursor: &mut &'a [u8], what: &'static str) -> Result<&'a [u8], So
 
 fn rle(cursor: &mut &[u8], count: usize, alphabet: u64) -> Result<Vec<u8>, Soc2Error> {
     let mut bytes = section(cursor, "indicator RLE")?;
+    // Trailings blanks are implied, so `count` can be far larger than the
+    // section; reserve it up front and fail rather than abort.
     let mut out = Vec::new();
+    out.try_reserve_exact(count)
+        .map_err(|_| Soc2Error::TooManyObservations(count as u64))?;
     while !bytes.is_empty() {
         let packed = read_uleb128(&mut bytes)?;
         let run = index(packed / alphabet)?
@@ -187,6 +193,9 @@ pub fn parse(mut cursor: &[u8]) -> Result<Soc2, Soc2Error> {
     };
     let mut integrator = initial(&mut packed, usize::from(delta_order))?;
     let mut values = Vec::new();
+    values
+        .try_reserve_exact(count)
+        .map_err(|_| Soc2Error::TooManyObservations(count as u64))?;
     let mut unpredicted = Vec::new();
     let mut block_header_counts = BTreeMap::new();
     while let Some((&header, rest)) = packed.split_first() {
@@ -1213,5 +1222,18 @@ mod tests {
         assert!(parse(&payload(1, 3, &[], &[], &[0])).is_err());
         assert!(parse(&payload(1, 1, &[], &[0, 2, 0], &[0])).is_err());
         assert!(parse(&payload(1, 0, &[11], &[], &[0])).is_err());
+    }
+
+    #[test]
+    fn oversized_count_is_an_error() {
+        // The count is a ULEB128, so a 15-byte chunk can declare 2^64 - 1
+        // observations; reserving that must be an error, not a panic.
+        let mut p = b"G01\0L1\0\0".to_vec();
+        p.extend(uleb(u64::MAX - 1));
+        p.push(0); // empty LLI RLE section
+        assert!(matches!(
+            parse(&p),
+            Err(Soc2Error::TooManyObservations(_))
+        ));
     }
 }
