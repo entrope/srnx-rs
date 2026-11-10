@@ -49,7 +49,7 @@ use crate::model::{
     Catalog, EpochRecord, EventRecord, ObsFile, SatId, SeriesBuilder, SignalFilter, SignalMasks,
 };
 use crate::rinex2_obs::{byte_at, parse_obs_at, split_lines};
-use crate::rinex_header::{self, Header, HeaderError, HeaderText, ObsCode, SatSystem};
+use crate::rinex_header::{self, Header, HeaderError, HeaderText, ObsCode};
 
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -407,27 +407,10 @@ fn parse_fixed(line: &str, start: usize, width: usize, decimals: u32) -> Option<
     Some(if negative { -acc } else { acc })
 }
 
-/// Parse the `A1,I2.2` satellite identifier at the start of an observation
-/// record.  A blank system letter is read as GPS and a blank tens digit as
-/// zero, for tolerance of non-conforming writers; anything else must be an
-/// upper-case system letter and a PRN from 1 to 99.
+/// Parse the `A1,I2.2` satellite identifier at the start of a record, as
+/// [`SatId::parse_name`] does for the three bytes.
 pub(crate) fn parse_sat_id(line: &str) -> Option<SatId> {
-    let system = match byte_at(line, 0) {
-        b' ' => SatSystem::GPS,
-        s @ b'A'..=b'Z' => SatSystem(s),
-        _ => return None,
-    };
-    let tens = match byte_at(line, 1) {
-        b' ' => 0,
-        d @ b'0'..=b'9' => d - b'0',
-        _ => return None,
-    };
-    let ones = match byte_at(line, 2) {
-        d @ b'0'..=b'9' => d - b'0',
-        _ => return None,
-    };
-    let prn = tens * 10 + ones;
-    (prn != 0).then_some(SatId::new(system, prn))
+    SatId::parse_name([byte_at(line, 0), byte_at(line, 1), byte_at(line, 2)])
 }
 
 // ---------------------------------------------------------------------------
@@ -437,6 +420,7 @@ pub(crate) fn parse_sat_id(line: &str) -> Option<SatId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rinex_header::SatSystem;
 
     // ---- unit tests -----------------------------------------------
 

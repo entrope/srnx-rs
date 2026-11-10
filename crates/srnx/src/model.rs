@@ -21,6 +21,32 @@ impl SatId {
     pub fn new(system: SatSystem, prn: u8) -> Self {
         Self { system, prn }
     }
+
+    /// Parse a three-byte RINEX satellite identifier: `[system, tens, ones]`,
+    /// e.g. `b"G13"` → GPS PRN 13.
+    ///
+    /// A blank system letter means GPS (the RINEX v2 convention) and a blank
+    /// tens digit means zero, for tolerance of non-conforming writers.
+    /// Anything else must be an upper-case system letter and a PRN from 1 to
+    /// 99.
+    pub(crate) fn parse_name([system, tens, ones]: [u8; 3]) -> Option<Self> {
+        let system = match system {
+            b' ' => SatSystem::GPS,
+            letter @ b'A'..=b'Z' => SatSystem(letter),
+            _ => return None,
+        };
+        let tens = match tens {
+            b' ' => 0,
+            digit @ b'0'..=b'9' => digit - b'0',
+            _ => return None,
+        };
+        let ones = match ones {
+            digit @ b'0'..=b'9' => digit - b'0',
+            _ => return None,
+        };
+        let prn = tens * 10 + ones;
+        (prn != 0).then_some(Self::new(system, prn))
+    }
 }
 
 impl std::fmt::Display for SatId {

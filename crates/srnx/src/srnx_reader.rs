@@ -2,7 +2,7 @@
 //!
 //! Entry points: [`read`] and [`catalog`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use thiserror::Error;
 
@@ -14,6 +14,7 @@ use crate::model::{
 };
 use crate::rinex2_obs::byte_at;
 use crate::rinex_header::{self, Header, HeaderError, HeaderText, ObsCode, SatSystem};
+use crate::sdir::Sdir;
 use crate::soc2::{Column, SatelliteColumns};
 use crate::socd::{self, ABSENT};
 
@@ -42,6 +43,10 @@ pub enum SrnxReadError {
     ValueOverflow,
     #[error("EVTF chunk {index} (from 0): {reason}")]
     BadEvent { index: usize, reason: &'static str },
+    #[error("satellite name {0:?} is not a RINEX satellite identifier")]
+    BadSatelliteName(String),
+    #[error("SDIR names satellite {0} more than once")]
+    DuplicateSatellite(SatId),
 }
 
 /// List the satellites in an SRNX file's `SDIR` chunk, each with the
@@ -51,9 +56,10 @@ pub fn catalog(bytes: &[u8]) -> Result<Catalog, SrnxReadError> {
     let rhdr_bytes = file.rhdr_payload().ok_or(SrnxReadError::NoRhdr)?;
     let header = rinex_header::parse(rhdr_bytes)?;
     let sdir = file.sdir()?.ok_or(SrnxReadError::NoSdir)?;
+    check_satellites(&sdir)?;
     let mut satellites = Vec::with_capacity(sdir.satellites.len());
     for entry in &sdir.satellites {
-        let sat_id = parse_sat_id(entry.sat_id);
+        let sat_id = satellite_id(entry.sat_id)?;
         let obs_codes = obs_codes_for_sat(&header, sat_id.system);
         let offsets = file.sate_offsets_at(entry.sate_offset, obs_codes.len())?;
         let observed = obs_codes
@@ -94,6 +100,7 @@ pub fn read(bytes: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, S
 
     // SDIR.
     let sdir = file.sdir()?.ok_or(SrnxReadError::NoSdir)?;
+    check_satellites(&sdir)?;
 
     let events = events(&file, &header, sdir.evtf_offset, total_epochs)?;
 
@@ -102,7 +109,7 @@ pub fn read(bytes: &[u8], filter: Option<SignalFilter<'_>>) -> Result<ObsFile, S
     let mut satellite_epochs = BTreeMap::new();
 
     for entry in &sdir.satellites {
-        let sat_id = parse_sat_id(entry.sat_id);
+        let sat_id = satellite_id(entry.sat_id)?;
         let sate_file_offset = entry.sate_offset;
 
         // Choose obs-code list for this satellite's system.
@@ -254,6 +261,21 @@ fn open(bytes: &[u8]) -> Result<SrnxFile<'_>, SrnxReadError> {
     Ok(file)
 }
 
+/// Check that the `SDIR` names each satellite once.  The spec says a name
+/// MUST be used in at most one `SATE` chunk, and `sdir::parse` checks the
+/// raw names, but the aliases that [`SatId::parse_name`] accepts (`G01`,
+/// `G 1`, ` 01`) would otherwise each add the satellite's observations.
+fn check_satellites(sdir: &Sdir) -> Result<(), SrnxReadError> {
+    let mut seen = HashSet::with_capacity(sdir.satellites.len());
+    for entry in &sdir.satellites {
+        let sat = satellite_id(entry.sat_id)?;
+        if !seen.insert(sat) {
+            return Err(SrnxReadError::DuplicateSatellite(sat));
+        }
+    }
+    Ok(())
+}
+
 // Gregorian day numbers, plus any leap seconds represented by the epoch
 // chunk, in units of `1 / units_per_second` s. A leap second remains in its
 // day's final minute and shifts all later days by 1 s.
@@ -320,27 +342,11 @@ fn epoch_to_record(e: &Epoch) -> EpochRecord {
     }
 }
 
-/// Parse a 3-byte SRNX satellite identifier into a [`SatId`].
-///
-/// Format: `[system_char, prn_tens, prn_ones]`, e.g. `b"G13"` → GPS PRN 13.
-/// A space in the system byte is treated as GPS (RINEX v2 convention).
-fn parse_sat_id(bytes: [u8; 3]) -> SatId {
-    let system = if bytes[0] == b' ' {
-        SatSystem::GPS
-    } else {
-        SatSystem(bytes[0])
-    };
-    let tens = if bytes[1].is_ascii_digit() {
-        bytes[1] - b'0'
-    } else {
-        0
-    };
-    let ones = if bytes[2].is_ascii_digit() {
-        bytes[2] - b'0'
-    } else {
-        0
-    };
-    SatId::new(system, tens * 10 + ones)
+/// A satellite name from an `SDIR` entry, which holds the RINEX identifier.
+fn satellite_id(name: [u8; 3]) -> Result<SatId, SrnxReadError> {
+    SatId::parse_name(name).ok_or_else(|| {
+        SrnxReadError::BadSatelliteName(String::from_utf8_lossy(&name).into_owned())
+    })
 }
 
 /// Return the observation-code slice to use for `system`.
@@ -497,24 +503,32 @@ mod tests {
     }
 
     #[test]
-    fn parse_sat_id_gps() {
-        let id = parse_sat_id(*b"G13");
-        assert_eq!(id.system, SatSystem::GPS);
-        assert_eq!(id.prn, 13);
+    fn a_sdir_name_must_be_a_rinex_identifier() {
+        // "g01" is not a satellite name: a lower-case system letter would
+        // otherwise silently collide with G01.
+        let bytes = one_epoch_srnx_named(*b"SOCD", &socd_payload(1, 7), &[*b"g01"]);
+        assert!(matches!(
+            read(&bytes, None),
+            Err(SrnxReadError::BadSatelliteName(name)) if name == "g01"
+        ));
     }
 
     #[test]
-    fn parse_sat_id_glonass() {
-        let id = parse_sat_id(*b"R10");
-        assert_eq!(id.system, SatSystem::GLONASS);
-        assert_eq!(id.prn, 10);
-    }
-
-    #[test]
-    fn parse_sat_id_single_digit() {
-        let id = parse_sat_id(*b"E01");
-        assert_eq!(id.system, SatSystem::GALILEO);
-        assert_eq!(id.prn, 1);
+    fn a_sdir_name_alias_is_a_duplicate() {
+        // " 01" and "G 1" are G01 too: listing them as well would give G01
+        // two values for the epoch.
+        for alias in [*b" 01", *b"G 1"] {
+            let bytes = one_epoch_srnx_named(*b"SOCD", &socd_payload(1, 7), &[*b"G01", alias]);
+            let g01 = SatId::new(SatSystem::GPS, 1);
+            assert!(matches!(
+                read(&bytes, None),
+                Err(SrnxReadError::DuplicateSatellite(sat)) if sat == g01
+            ));
+            assert!(matches!(
+                catalog(&bytes),
+                Err(SrnxReadError::DuplicateSatellite(sat)) if sat == g01
+            ));
+        }
     }
 
     #[test]
@@ -589,8 +603,15 @@ mod tests {
     }
 
     /// An SRNX file with null digests: a one-code v2 header, one epoch, one
-    /// satellite, and `payload` as its only observation chunk.
+    /// satellite named `G01`, and `payload` as its only observation chunk.
     fn one_epoch_srnx(fourcc: [u8; 4], payload: &[u8]) -> Vec<u8> {
+        one_epoch_srnx_named(fourcc, payload, &[*b"G01"])
+    }
+
+    /// [`one_epoch_srnx`] with the satellite named `names[0]`, and an `SDIR`
+    /// entry for each of `names` that points at its `SATE` chunk.
+    fn one_epoch_srnx_named(fourcc: [u8; 4], payload: &[u8], names: &[[u8; 3]]) -> Vec<u8> {
+        let name = names[0];
         let head = 21; // FOURCC + one-byte length + 16-byte padded payload
         let mut body = Vec::new();
         let rhdr = format!(
@@ -617,7 +638,8 @@ mod tests {
         // with a placeholder to learn its length.
         let sate_offset = body.len();
         let sate = |relative: i64| {
-            let mut p = b"G01\0".to_vec();
+            let mut p = name.to_vec();
+            p.push(0);
             crate::leb128::write_sleb128(&mut p, relative);
             crate::leb128::write_uleb128(&mut p, 0); // one presence run
             crate::leb128::write_uleb128(&mut p, 0); // zero absent epochs
@@ -633,8 +655,10 @@ mod tests {
         let mut sdir = Vec::new();
         crate::leb128::write_uleb128(&mut sdir, (head + epoc_offset) as u64);
         crate::leb128::write_uleb128(&mut sdir, 0); // no events
-        sdir.extend_from_slice(b"G01");
-        crate::leb128::write_uleb128(&mut sdir, (head + sate_offset) as u64);
+        for name in names {
+            sdir.extend_from_slice(name);
+            crate::leb128::write_uleb128(&mut sdir, (head + sate_offset) as u64);
+        }
         let sdir_offset = head + body.len();
         push_chunk(&mut body, *b"SDIR", &sdir);
 
