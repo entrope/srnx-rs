@@ -175,12 +175,15 @@ impl<'a> SrnxFile<'a> {
         })
     }
 
-    /// Locate the body chunk whose FOURCC tag begins at `offset`. Linear
-    /// scan; sufficient for the small number of named offsets that exist in
-    /// any one file (currently SDIR + epoch chunk + first EVTF).
+    /// Locate the body chunk whose FOURCC tag begins at `offset`.
+    ///
+    /// Chunks are in increasing file order, so this is a binary search:
+    /// the reader resolves an offset for every observation column, and a
+    /// file has one chunk per (satellite, code) plus its metadata.
     #[must_use]
     pub fn chunk_at_offset(&self, offset: u64) -> Option<&BodyChunk<'a>> {
-        self.chunks.iter().find(|c| c.file_offset == offset)
+        let index = self.chunks.partition_point(|c| c.file_offset < offset);
+        self.chunks.get(index).filter(|c| c.file_offset == offset)
     }
 
     /// Convenience: the payload of the first `RHDR` chunk, if any. The spec
@@ -522,6 +525,23 @@ mod tests {
         let bytes = [b'F', b'A', b'K', b'E', 0x00];
         let err = SrnxFile::parse(&bytes).unwrap_err();
         assert!(matches!(err, FileError::NotSrnxFile { got } if &got == b"FAKE"));
+    }
+
+    #[test]
+    fn chunk_at_offset_requires_an_exact_offset() {
+        let bytes = crate::test_data("at01_v211_1hz.srnx");
+        let file = SrnxFile::parse(&bytes).unwrap();
+        // The SRNX chunk at offset 0 is framing, not a body chunk.
+        assert!(file.chunk_at_offset(0).is_none());
+        for chunk in &file.chunks {
+            assert_eq!(
+                file.chunk_at_offset(chunk.file_offset)
+                    .map(|found| found.fourcc),
+                Some(chunk.fourcc)
+            );
+            assert!(file.chunk_at_offset(chunk.file_offset + 1).is_none());
+        }
+        assert!(file.chunk_at_offset(u64::MAX).is_none());
     }
 
     #[test]
