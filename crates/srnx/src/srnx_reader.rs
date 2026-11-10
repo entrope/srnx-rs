@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 
 use thiserror::Error;
 
+use crate::digest::DigestId;
 use crate::epoc::{Epoch, EpochChunkKind};
 use crate::file::{FileError, SrnxFile};
 use crate::model::{
@@ -25,6 +26,10 @@ pub enum SrnxReadError {
     Header(#[from] HeaderError),
     #[error("file-level digest mismatch")]
     FileDigestMismatch,
+    #[error("SRNX chunk digest mismatch")]
+    SrnxChunkDigestMismatch,
+    #[error("per-chunk digest mismatch at file offset {0}")]
+    ChunkDigestMismatch(u64),
     #[error("no RHDR chunk in SRNX file")]
     NoRhdr,
     #[error("no SDIR chunk in SRNX file")]
@@ -225,10 +230,24 @@ fn events(
     Ok(events)
 }
 
+/// Parse the file framing and verify whichever digests the file carries.
+///
+/// A valid file-level digest covers every byte, so it implies valid
+/// per-chunk digests and is the only one checked.  Without one, the
+/// per-chunk digests (and the SRNX chunk's own) are the only integrity
+/// check the file has, so each is enforced.
 fn open(bytes: &[u8]) -> Result<SrnxFile<'_>, SrnxReadError> {
     let file = SrnxFile::parse(bytes)?;
     if !file.file_digest_ok {
         return Err(SrnxReadError::FileDigestMismatch);
+    }
+    if file.header.file_digest == DigestId::Null {
+        if !file.srnx_digest_ok {
+            return Err(SrnxReadError::SrnxChunkDigestMismatch);
+        }
+        if let Some(chunk) = file.chunks.iter().find(|chunk| !chunk.digest_ok) {
+            return Err(SrnxReadError::ChunkDigestMismatch(chunk.file_offset));
+        }
     }
     Ok(file)
 }
@@ -627,34 +646,86 @@ mod tests {
         out
     }
 
+    /// A `SOCD` payload with `count` SLEB128-coded values.
+    fn socd_payload(count: u64, value: i64) -> Vec<u8> {
+        let mut p = b"G01\0L1\0\0".to_vec();
+        crate::leb128::write_uleb128(&mut p, count - 1);
+        p.extend([0, 0]); // no LLI or SSI runs
+        let mut obs = vec![0, 0xFF]; // schema 0, SLEB128 run
+        crate::leb128::write_uleb128(&mut obs, count - 1);
+        for _ in 0..count {
+            crate::leb128::write_sleb128(&mut obs, value);
+        }
+        crate::leb128::write_uleb128(&mut p, obs.len() as u64);
+        p.extend(obs);
+        p
+    }
+
     #[test]
     fn observation_count_must_match_the_satellite_epochs() {
         let key = (SatId::new(SatSystem::GPS, 1), ObsCode::from_v2("L1").unwrap());
-        let payload = |count: u64, value: i64| {
-            let mut p = b"G01\0L1\0\0".to_vec();
-            crate::leb128::write_uleb128(&mut p, count - 1);
-            p.extend([0, 0]); // no LLI or SSI runs
-            let mut obs = vec![0, 0xFF]; // schema 0, SLEB128 run
-            crate::leb128::write_uleb128(&mut obs, count - 1);
-            for _ in 0..count {
-                crate::leb128::write_sleb128(&mut obs, value);
-            }
-            crate::leb128::write_uleb128(&mut p, obs.len() as u64);
-            p.extend(obs);
-            p
-        };
-
-        let file = read(&one_epoch_srnx(*b"SOCD", &payload(1, 7)), None).unwrap();
-        assert_eq!(file.observations[&key], [(0, Obs { value: 7, lli: b' ', ssi: b' ' })]);
+        let file = read(&one_epoch_srnx(*b"SOCD", &socd_payload(1, 7)), None).unwrap();
+        assert_eq!(
+            file.observations[&key],
+            [(0, Obs { value: 7, lli: b' ', ssi: b' ' })]
+        );
 
         // A chunk may not declare more observations than the satellite has
         // epochs, and the check must precede decoding the chunk.
         assert!(matches!(
-            read(&one_epoch_srnx(*b"SOCD", &payload(2, 7)), None),
+            read(&one_epoch_srnx(*b"SOCD", &socd_payload(2, 7)), None),
             Err(SrnxReadError::File(FileError::ObservationCount {
                 declared: 2,
                 present: 1
             }))
+        ));
+    }
+
+    #[test]
+    fn chunk_digests_are_checked_without_a_file_digest() {
+        // Our writer, with per-chunk digests but no file digest.
+        let file = read(&one_epoch_srnx(*b"SOCD", &socd_payload(1, 7)), None).unwrap();
+        let mut bytes = Vec::new();
+        crate::writer::write_with(
+            &file,
+            &crate::writer::WriteOptions {
+                obs_chunk: crate::writer::ObsChunk::Socd,
+                chunk_digest: crate::writer::Digest::Crc32c,
+                file_digest: crate::writer::Digest::None,
+                ..Default::default()
+            },
+            &mut bytes,
+        )
+        .unwrap();
+        read(&bytes, None).expect("a valid file reads");
+
+        // The file digest covers every byte, so it is the only check made
+        // when present; without one, every chunk digest must verify.
+        let srnx_digest = {
+            let framed = crate::chunk::read_framed(&bytes).unwrap();
+            bytes.len() - framed.after_payload.len()
+        };
+        let mut tampered = bytes.clone();
+        tampered[srnx_digest] ^= 0x01;
+        assert!(matches!(
+            read(&tampered, None),
+            Err(SrnxReadError::SrnxChunkDigestMismatch)
+        ));
+
+        let socd = SrnxFile::parse(&bytes)
+            .unwrap()
+            .chunks
+            .iter()
+            .find(|chunk| chunk.fourcc == *b"SOCD")
+            .unwrap()
+            .file_offset;
+        let framed = crate::chunk::read_framed(&bytes[usize::try_from(socd).unwrap()..]).unwrap();
+        let digest_at = bytes.len() - framed.after_payload.len();
+        let mut tampered = bytes.clone();
+        tampered[digest_at] ^= 0x01;
+        assert!(matches!(
+            read(&tampered, None),
+            Err(SrnxReadError::ChunkDigestMismatch(offset)) if offset == socd
         ));
     }
 }
