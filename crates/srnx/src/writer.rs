@@ -705,6 +705,9 @@ fn sate_payload(
         });
         write_sleb128(&mut payload, relative);
     }
+    // Every satellite has at least one epoch (it is in the model only
+    // through a series or a presence list), so the run count-minus-1 exists.
+    debug_assert!(!epochs.is_empty(), "a satellite has at least one epoch");
     // Epoch presence: runs of consecutive epochs.
     let mut runs = Vec::new();
     for &e in epochs {
@@ -782,6 +785,8 @@ fn scaled(value: i64, scale: u64) -> i64 {
 }
 
 fn socd_payload(name: [u8; 8], column: &Column, scratch: &mut Scratch) -> Vec<u8> {
+    // A column exists only for a satellite with at least one epoch.
+    debug_assert!(!column.values.is_empty(), "a column has at least one epoch");
     let mut payload = name.to_vec();
     write_uleb128(&mut payload, column.values.len() as u64 - 1);
     write_rle(
@@ -1001,6 +1006,7 @@ impl Soc2Coder<'_> {
             .min_by_key(|(p, packed)| predictor_bytes(*p) + packed.len())
             .unwrap();
 
+        debug_assert!(!column.values.is_empty(), "a column has at least one epoch");
         let mut payload = name.to_vec();
         write_uleb128(&mut payload, column.values.len() as u64 - 1);
         write_rle(
