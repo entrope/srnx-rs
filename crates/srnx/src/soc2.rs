@@ -1231,9 +1231,6 @@ mod tests {
         let mut p = b"G01\0L1\0\0".to_vec();
         p.extend(uleb(u64::MAX - 1));
         p.push(0); // empty LLI RLE section
-        assert!(matches!(
-            parse(&p),
-            Err(Soc2Error::TooManyObservations(_))
-        ));
+        assert!(matches!(parse(&p), Err(Soc2Error::TooManyObservations(_))));
     }
 }

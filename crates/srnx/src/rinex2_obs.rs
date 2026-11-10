@@ -1172,10 +1172,7 @@ mod tests {
         text.extend(b" 24 10  1  0  0  0.0000000  0  1G01\n  20000000.000\n");
         let f = parse(&text, None).unwrap();
         assert_eq!(f.epochs.len(), 1);
-        assert_eq!(
-            f.header.get_line("MARKER NAME"),
-            Some("Z?rich".to_string())
-        );
+        assert_eq!(f.header.get_line("MARKER NAME"), Some("Z?rich".to_string()));
     }
 
     #[test]

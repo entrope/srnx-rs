@@ -663,11 +663,21 @@ mod tests {
 
     #[test]
     fn observation_count_must_match_the_satellite_epochs() {
-        let key = (SatId::new(SatSystem::GPS, 1), ObsCode::from_v2("L1").unwrap());
+        let key = (
+            SatId::new(SatSystem::GPS, 1),
+            ObsCode::from_v2("L1").unwrap(),
+        );
         let file = read(&one_epoch_srnx(*b"SOCD", &socd_payload(1, 7)), None).unwrap();
         assert_eq!(
             file.observations[&key],
-            [(0, Obs { value: 7, lli: b' ', ssi: b' ' })]
+            [(
+                0,
+                Obs {
+                    value: 7,
+                    lli: b' ',
+                    ssi: b' '
+                }
+            )]
         );
 
         // A chunk may not declare more observations than the satellite has

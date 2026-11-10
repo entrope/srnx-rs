@@ -406,13 +406,7 @@ pub(crate) fn to_text(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
         Err(_) => std::borrow::Cow::Owned(
             bytes
                 .iter()
-                .map(|&b| {
-                    if b < 0x80 {
-                        char::from(b)
-                    } else {
-                        '?'
-                    }
-                })
+                .map(|&b| if b < 0x80 { char::from(b) } else { '?' })
                 .collect(),
         ),
     }

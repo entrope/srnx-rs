@@ -761,10 +761,7 @@ mod tests {
         // A count of u64::MAX cannot be reserved.
         let mut p = b"G01\0L1\0\0".to_vec();
         p.extend(enc_uleb(u64::MAX - 1));
-        assert!(matches!(
-            parse(&p),
-            Err(SocdError::TooManyObservations(_))
-        ));
+        assert!(matches!(parse(&p), Err(SocdError::TooManyObservations(_))));
 
         // A run longer than the declared count, for every run header.
         for header in [0xFD, 0xFE, 0xFF] {
@@ -795,7 +792,6 @@ mod tests {
     }
 
     // ── Fixture integration tests ─────────────────────────────────────────
-
 
     /// The payloads of every `SOCD` chunk in an SRNX fixture, in file order.
     fn fixture_socd_chunks(srnx_name: &str) -> Vec<Vec<u8>> {
