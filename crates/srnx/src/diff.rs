@@ -232,6 +232,15 @@ fn compare_satellite_epochs(
     }
 }
 
+/// The timestamp of epoch `index` in `file`.  A reader-built `ObsFile` has an
+/// entry for every index its series use, but a model built by hand may not;
+/// report that instead of panicking.
+fn epoch_text(file: &ObsFile, index: usize) -> String {
+    file.epochs
+        .get(index)
+        .map_or_else(|| format!("#{index} (no such epoch)"), fmt_epoch)
+}
+
 /// Event epoch lines compare field by field, so the leading zero that
 /// `crx2rnx` leaves off values below one (`-.123`) does not matter.
 fn epoch_lines_eq(a: &str, b: &str) -> bool {
@@ -296,14 +305,14 @@ fn compare_series(
             std::cmp::Ordering::Less => {
                 out.push(format!(
                     "{prefix} epoch[{ea}] {}: only in {label_a}",
-                    fmt_epoch(&file_a.epochs[ea])
+                    epoch_text(file_a, ea)
                 ));
                 ia += 1;
             }
             std::cmp::Ordering::Greater => {
                 out.push(format!(
                     "{prefix} epoch[{eb}] {}: only in {label_b}",
-                    fmt_epoch(&file_b.epochs[eb])
+                    epoch_text(file_b, eb)
                 ));
                 ib += 1;
             }
@@ -311,7 +320,7 @@ fn compare_series(
                 if !obs_eq(oa, ob) {
                     out.push(format!(
                         "{prefix} epoch[{ea}] {}: mismatch: {label_a}({})  {label_b}({})",
-                        fmt_epoch(&file_a.epochs[ea]),
+                        epoch_text(file_a, ea),
                         fmt_obs(oa),
                         fmt_obs(ob),
                     ));
@@ -326,7 +335,7 @@ fn compare_series(
         let (ea, _) = sa[ia];
         out.push(format!(
             "{prefix} epoch[{ea}] {}: only in {label_a}",
-            fmt_epoch(&file_a.epochs[ea])
+            epoch_text(file_a, ea)
         ));
         ia += 1;
     }
@@ -334,7 +343,7 @@ fn compare_series(
         let (eb, _) = sb[ib];
         out.push(format!(
             "{prefix} epoch[{eb}] {}: only in {label_b}",
-            fmt_epoch(&file_b.epochs[eb])
+            epoch_text(file_b, eb)
         ));
         ib += 1;
     }
@@ -442,6 +451,22 @@ mod tests {
         assert_eq!(
             compare(&a, &b, "a", "b"),
             ["G01 listed in epoch[0] 2024-10-01 00:00:00.0000000: only in a"]
+        );
+    }
+
+    #[test]
+    fn a_series_may_name_a_missing_epoch() {
+        // Models are public and can be built by hand; compare must report an
+        // epoch the model does not have rather than index past the vector.
+        let a = file(Vec::new(), Some(1));
+        let mut b = file(Vec::new(), Some(1));
+        for series in b.observations.values_mut() {
+            series[0].0 = 5;
+        }
+        let diffs = compare(&a, &b, "a", "b");
+        assert!(
+            diffs.iter().any(|diff| diff.contains("no such epoch")),
+            "{diffs:?}"
         );
     }
 

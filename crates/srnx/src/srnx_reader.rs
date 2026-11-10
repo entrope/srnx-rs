@@ -344,9 +344,8 @@ fn epoch_to_record(e: &Epoch) -> EpochRecord {
 
 /// A satellite name from an `SDIR` entry, which holds the RINEX identifier.
 fn satellite_id(name: [u8; 3]) -> Result<SatId, SrnxReadError> {
-    SatId::parse_name(name).ok_or_else(|| {
-        SrnxReadError::BadSatelliteName(String::from_utf8_lossy(&name).into_owned())
-    })
+    SatId::parse_name(name)
+        .ok_or_else(|| SrnxReadError::BadSatelliteName(String::from_utf8_lossy(&name).into_owned()))
 }
 
 /// Return the observation-code slice to use for `system`.
